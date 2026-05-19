@@ -1,0 +1,316 @@
+//@version=5
+// ============================================================
+// V7 Intraday Sniper (Long) + PD Levels
+// Exchange : Bursa Malaysia (KLSE)
+// Timeframe: 5-Minute (primary trigger bar)
+// Changes  : [v7-1]  PDH/PDL/PDC now gate entries (not just visual)
+//            [v7-2]  PD levels plotted as clean horizontal lines
+//            [v7-3]  Volume baseline raised to 20 bars (was 10)
+//            [v7-4]  Volume surge raised to 1.5x default (was 1.2x)
+//            [v7-5]  Pullback quality gate — max depth below EMA9
+//            [v7-6]  Daily trend anchor via request.security
+//            [v7-7]  KLSE liquidity gate (daily avg vol + min price)
+//            [v7-8]  Exit fires regardless of EMA/VWAP relationship
+//            [v7-9]  Exit also fires on PDL break (key support gone)
+//            [v7-10] Exit debounced — must persist 2 bars
+//            [v7-11] ATR SL/TP locked at entry, auto-reset on exit
+//            [v7-12] All signals deduplicated (fire once per state)
+//            [v7-13] KLSE session filter (open/lunch/close noise)
+//            [v7-14] PDH resistance zone + PDL bounce zone highlights
+//            [v7-15] HUD table with signal state, PD zone, SL/TP
+//            [v7-16] barstate.isrealtime for live tick refresh
+// ============================================================
+indicator("V7 Intraday Sniper (Long) + PD Levels", overlay=true, max_lines_count=10, max_labels_count=50)
+
+// ============================================================
+// INPUTS
+// ============================================================
+grp_pd   = "Previous Day Levels"
+pdh_res_pct  = input.float(1.0, "PDH Resistance Zone (%)", minval=0.1, maxval=5.0, step=0.1, group=grp_pd, tooltip="Block entries when price is within this % below PDH — overhead supply")
+pdl_sup_pct  = input.float(1.0, "PDL Support Zone (%)",    minval=0.1, maxval=5.0, step=0.1, group=grp_pd, tooltip="Flag entries bouncing within this % above PDL — confluence support")
+
+grp_ema  = "EMA Settings"
+ema_fast_len = input.int(9,  "Fast EMA", minval=2,  maxval=50,  group=grp_ema)
+ema_slow_len = input.int(20, "Slow EMA", minval=5,  maxval=100, group=grp_ema)
+
+grp_vol  = "Volume Settings"
+vol_len  = input.int(20,    "Volume Baseline (bars)",   minval=5, maxval=50,  group=grp_vol)
+vol_mult = input.float(1.5, "Volume Surge Multiplier",  minval=1.0, maxval=5.0, step=0.1, group=grp_vol)
+
+grp_pull = "Pullback Quality"
+max_pull_pct = input.float(0.5, "Max depth below EMA Fast (%)", minval=0.1, maxval=3.0, step=0.1, group=grp_pull, tooltip="Reject entries where bar low crashed more than this % under EMA9 — filters weak recoveries")
+
+grp_risk = "ATR Risk Management"
+atr_len      = input.int(14,    "ATR Period",       group=grp_risk)
+atr_sl_mult  = input.float(1.5, "Stop-Loss ATR x",  group=grp_risk, minval=0.5, step=0.1)
+atr_tp1_mult = input.float(2.0, "TP1 ATR x",        group=grp_risk, minval=0.5, step=0.1)
+atr_tp2_mult = input.float(3.5, "TP2 ATR x",        group=grp_risk, minval=1.0, step=0.1)
+
+grp_filt = "KLSE Filters"
+use_daily    = input.bool(true,   "Daily Trend Gate",                 group=grp_filt)
+min_price    = input.float(0.50,  "Min Price (RM)",                   group=grp_filt)
+min_vol      = input.int(200000,  "Min Daily Avg Volume",             group=grp_filt)
+sess_filter  = input.bool(true,   "KLSE Session Filter",              group=grp_filt, tooltip="Blocks signals during opening 30min (09:00-09:30), lunch zone (12:30-14:30), pre-closing (16:45-17:00)")
+
+grp_disp = "Display"
+show_sl      = input.bool(true,  "Show SL / TP Lines",        group=grp_disp)
+show_zones   = input.bool(true,  "Show PD Zone Highlights",   group=grp_disp)
+hudPosStr    = input.string("Bottom Right", "HUD Position", options=["Top Left","Top Center","Top Right","Bottom Left","Bottom Center","Bottom Right"], group=grp_disp)
+
+// ============================================================
+// COLOURS
+// ============================================================
+c_good  = color.new(#00E676, 0)
+c_warn  = color.new(#FFD740, 0)
+c_bad   = color.new(#FF5252, 0)
+c_blue  = color.new(#2196F3, 0)
+c_aqua  = color.new(#00BCD4, 0)
+c_gray  = color.new(#9E9E9E, 0)
+c_orng  = color.new(#FF9800, 0)
+c_white = color.new(#FFFFFF, 0)
+c_hdr   = color.new(#1A237E, 0)
+c_bg    = color.new(#0D0D0D, 0)
+c_dark  = color.new(#161B22, 0)
+c_yes   = color.new(#0D3320, 0)
+c_no    = color.new(#3D0C0C, 0)
+
+// ============================================================
+// [v7-7] LAYER 0 — KLSE LIQUIDITY GATE (daily-anchored)
+// Uses daily avg vol so gate is correct on any chart timeframe.
+// ============================================================
+d_avg_vol   = request.security(syminfo.tickerid, "D", ta.sma(volume, 20), lookahead=barmerge.lookahead_off)
+liquidityOk = close >= min_price and d_avg_vol >= min_vol
+
+// ============================================================
+// [v7-6] LAYER 1 — DAILY TREND ANCHOR
+// EMA 50 > 150 > 200 stack on daily timeframe.
+// Ensures 5m entry is aligned with the dominant trend.
+// ============================================================
+f_daily_trend() =>
+    _e50  = ta.ema(close, 50)
+    _e150 = ta.ema(close, 150)
+    _e200 = ta.ema(close, 200)
+    not na(_e50) and not na(_e150) and not na(_e200) and close > _e200 and _e50 > _e150 and _e150 > _e200
+
+dailyTrend = request.security(syminfo.tickerid, "D", f_daily_trend(), lookahead=barmerge.lookahead_off)
+dailyPass  = use_daily ? dailyTrend : true
+
+// ============================================================
+// [v7-13] LAYER 2 — KLSE SESSION FILTER
+// Official Bursa Malaysia hours (MYT = UTC+8):
+//   Morning continuous trading : 09:00 – 12:30
+//   Lunch break                : 12:30 – 14:30
+//   Afternoon pre-open         : 14:00 – 14:30
+//   Afternoon continuous       : 14:30 – 16:45
+//   Pre-closing & closing      : 16:45 – 17:00
+// Blocked zones: opening noise | full lunch | pre-closing auction
+// TradingView respects MYX exchange timezone (UTC+8) automatically.
+// ============================================================
+in_open_noise  = not na(time(timeframe.period, "0900-0930"))
+in_lunch_zone  = not na(time(timeframe.period, "1230-1430"))
+in_close_noise = not na(time(timeframe.period, "1645-1700"))
+sessionNoise   = sess_filter and (in_open_noise or in_lunch_zone or in_close_noise)
+sessionOk      = not sessionNoise
+
+// ============================================================
+// [v7-1] LAYER 3 — PREVIOUS DAY LEVELS
+// [1] + lookahead_on = yesterday's completed values, non-repainting.
+// ============================================================
+[pdh, pdl, pdc] = request.security(syminfo.tickerid, "D", [high[1], low[1], close[1]], lookahead=barmerge.lookahead_on)
+
+// PD proximity analysis
+pdh_dist_pct = not na(pdh) ? (pdh - close) / pdh * 100 : 100.0
+pdl_dist_pct = not na(pdl) ? (close - pdl) / pdl * 100 : 100.0
+near_pdh     = pdh_dist_pct >= 0 and pdh_dist_pct < pdh_res_pct
+near_pdl     = pdl_dist_pct >= 0 and pdl_dist_pct < pdl_sup_pct
+above_pdc    = not na(pdc) and close > pdc
+
+// [v7-2] PD Levels as clean horizontal lines (not circles)
+plot(pdh, title="Prev Day High",  color=color.new(#FF5252, 20), style=plot.style_line,  linewidth=1)
+plot(pdl, title="Prev Day Low",   color=color.new(#00E676, 20), style=plot.style_line,  linewidth=1)
+plot(pdc, title="Prev Day Close", color=color.new(#9E9E9E, 50), style=plot.style_line,  linewidth=1)
+
+// [v7-14] PD zone background highlights
+bgcolor(show_zones and near_pdh ? color.new(#FF5252, 90) : na, title="PDH Resistance Zone")
+bgcolor(show_zones and near_pdl ? color.new(#00E676, 90) : na, title="PDL Support Zone")
+
+// ============================================================
+// LAYER 4 — INTRADAY CORE INDICATORS
+// ============================================================
+vwap     = ta.vwap(hlc3)
+ema_fast = ta.ema(close, ema_fast_len)
+ema_slow = ta.ema(close, ema_slow_len)
+
+plot(vwap,     title="VWAP",     color=color.new(color.orange, 10), linewidth=2)
+plot(ema_fast, title="EMA Fast", color=color.new(color.aqua,   20), linewidth=1)
+plot(ema_slow, title="EMA Slow", color=color.new(color.purple, 20), linewidth=1)
+
+// ============================================================
+// [v7-3][v7-4] LAYER 5 — VOLUME (20-bar baseline, 1.5x surge)
+// ============================================================
+vol_avg   = ta.sma(volume, vol_len)
+vol_surge = volume > vol_avg * vol_mult
+vol_fade  = volume < vol_avg * 0.6
+
+// ============================================================
+// [v7-5] LAYER 6 — PULLBACK QUALITY + REGIME CHECK
+// qualityPull: bar low touched EMA fast but did not crash more
+// than max_pull_pct% below it — a controlled technical pullback.
+// ============================================================
+aboveVwap    = close > vwap
+intradayBull = ema_fast > ema_slow and aboveVwap
+pullLow      = low <= ema_fast
+pullDepth    = pullLow ? (ema_fast - low) / ema_fast * 100 : 0.0
+qualityPull  = pullLow and pullDepth <= max_pull_pct
+
+// ============================================================
+// ENTRY LOGIC — two tiers
+// SNIPE : all gates pass + quality pullback + volume surge
+// WATCH : gates pass + pullback forming, waiting for volume
+// ============================================================
+longBullish  = aboveVwap and ema_fast > ema_slow
+longPullback = qualityPull and close >= vwap and close > open and close > close[1]
+
+longTrigger = dailyPass and liquidityOk and sessionOk and not near_pdh and longBullish and longPullback and vol_surge
+longWatch   = dailyPass and liquidityOk and sessionOk and not near_pdh and longBullish and qualityPull and close >= vwap and not vol_surge
+
+// [v7-12] Deduplication — fire only on first bar of each state
+new_trigger = longTrigger and not longTrigger[1]
+new_watch   = longWatch   and not longWatch[1]   and not longTrigger
+
+// ============================================================
+// [v7-8][v7-9][v7-10] EXIT LOGIC — comprehensive + debounced
+// Fires on EITHER condition (no longer gated by EMA/VWAP):
+//   a) Close crosses under EMA fast (momentum fade)
+//   b) Close breaks below PDL (key structural support gone)
+// Debounced: both raw conditions must be true on 2 consecutive
+// bars to prevent single-bar whipsaws from firing false exits.
+// ============================================================
+exit_a   = ta.crossunder(close, ema_fast)
+exit_b   = not na(pdl) and close < pdl
+exit_raw = exit_a or exit_b
+exit_sig = exit_raw and exit_raw[1]
+new_exit = exit_sig and not exit_sig[1]
+
+// ============================================================
+// [v7-11] LOCKED ATR SL / TP (anchored at entry bar)
+// Auto-resets when SL is hit or exit fires.
+// ============================================================
+atr_val = ta.atr(atr_len)
+
+var float sl_locked  = na
+var float tp1_locked = na
+var float tp2_locked = na
+
+if new_trigger
+    sl_locked  := close - atr_val * atr_sl_mult
+    tp1_locked := close + atr_val * atr_tp1_mult
+    tp2_locked := close + atr_val * atr_tp2_mult
+
+if exit_sig or (not na(sl_locked) and close < sl_locked)
+    sl_locked  := na
+    tp1_locked := na
+    tp2_locked := na
+
+// Locked level lines
+plot(show_sl and not na(sl_locked)  ? sl_locked  : na, title="Stop Loss",    color=color.new(#FF5252, 0), linewidth=1, style=plot.style_linebr)
+plot(show_sl and not na(tp1_locked) ? tp1_locked : na, title="Take Profit 1", color=color.new(#00E676, 0), linewidth=1, style=plot.style_linebr)
+plot(show_sl and not na(tp2_locked) ? tp2_locked : na, title="Take Profit 2", color=color.new(#FFD740, 0), linewidth=1, style=plot.style_linebr)
+
+// ============================================================
+// VISUAL SIGNALS
+// ============================================================
+// Main entry signal
+plotshape(new_trigger, title="SNIPE Entry", style=shape.labelup,    location=location.belowbar, color=color.new(#00E676, 0),  textcolor=color.white, text="SNIPE", size=size.normal)
+
+// PDL bounce confluence marker (extra diamond when bouncing off PDL support)
+plotshape(new_trigger and near_pdl, title="PDL Bounce", style=shape.diamond, location=location.belowbar, color=color.new(#00BCD4, 0), textcolor=color.white, size=size.tiny)
+
+// Watch — setup forming, no volume yet
+plotshape(new_watch, title="WATCH", style=shape.triangleup, location=location.belowbar, color=color.new(#FFD740, 20), textcolor=color.white, size=size.small)
+
+// Exit
+plotshape(new_exit, title="EXIT", style=shape.labeldown, location=location.abovebar, color=color.new(#FF5252, 10), textcolor=color.white, text="EXIT", size=size.small)
+
+// Bar colour — only the signal bar, everything else default
+barcolor(new_trigger ? color.new(color.lime, 60) : new_exit ? color.new(color.red, 60) : na, title="Signal barcolor")
+
+// Session noise overlay — subtle red tint when blocked
+bgcolor(sessionNoise ? color.new(#FF5252, 96) : na, title="Session noise tint")
+
+// ============================================================
+// [v7-15][v7-16] HUD TABLE
+// ============================================================
+hudPos = switch hudPosStr
+    "Top Left"      => position.top_left
+    "Top Center"    => position.top_center
+    "Top Right"     => position.top_right
+    "Bottom Left"   => position.bottom_left
+    "Bottom Center" => position.bottom_center
+    => position.bottom_right
+
+var table hud = table.new(hudPos, 2, 10, bgcolor=c_bg, border_color=color.new(#303030, 0), border_width=1, frame_color=c_blue, frame_width=1)
+
+f_hrow(r, lbl, val, val_bg, val_fg) =>
+    table.cell(hud, 0, r, lbl, bgcolor=c_dark, text_color=c_gray,   text_size=size.tiny, text_halign=text.align_left)
+    table.cell(hud, 1, r, val, bgcolor=val_bg,  text_color=val_fg,   text_size=size.tiny, text_halign=text.align_center)
+
+if barstate.islast or barstate.isrealtime
+
+    // Header
+    table.cell(hud, 0, 0, "SNIPER  5m",  bgcolor=c_hdr, text_color=c_blue,  text_size=size.small, text_halign=text.align_center)
+    table.cell(hud, 1, 0, syminfo.ticker, bgcolor=c_hdr, text_color=c_white, text_size=size.small, text_halign=text.align_center)
+
+    // Daily trend
+    f_hrow(1, "Daily Trend", dailyTrend ? "PASS" : "FAIL", dailyTrend ? c_yes : c_no, dailyTrend ? c_good : c_bad)
+
+    // Liquidity
+    f_hrow(2, "Liquidity", liquidityOk ? "OK" : "THIN", liquidityOk ? c_yes : c_no, liquidityOk ? c_good : c_bad)
+
+    // Session
+    f_hrow(3, "Session", sessionOk ? "CLEAN" : "NOISY", sessionOk ? c_yes : c_no, sessionOk ? c_good : c_warn)
+
+    // PD Zone
+    pd_lbl = near_pdh ? "PDH RESIST" : near_pdl ? "PDL BOUNCE" : above_pdc ? "ABOVE PDC" : "BELOW PDC"
+    pd_bg  = near_pdh ? c_no : near_pdl ? c_yes : c_dark
+    pd_fg  = near_pdh ? c_bad : near_pdl ? c_good : c_gray
+    f_hrow(4, "PD Zone", pd_lbl, pd_bg, pd_fg)
+
+    // Intraday regime
+    reg_lbl = intradayBull ? "BULL" : aboveVwap ? "CHOP" : "BELOW VWAP"
+    reg_fg  = intradayBull ? c_good : aboveVwap ? c_warn : c_bad
+    f_hrow(5, "Regime", reg_lbl, c_dark, reg_fg)
+
+    // Pullback quality
+    pull_lbl = qualityPull ? "QUALITY" : pullLow ? "TOO DEEP" : "NONE"
+    pull_fg  = qualityPull ? c_good : pullLow ? c_warn : c_gray
+    f_hrow(6, "Pullback", pull_lbl, c_dark, pull_fg)
+
+    // Volume
+    vol_lbl = vol_surge ? "SURGE" : vol_fade ? "FADING" : "NORMAL"
+    vol_bg  = vol_surge ? c_yes : c_dark
+    vol_fg  = vol_surge ? c_good : vol_fade ? c_bad : c_gray
+    f_hrow(7, "Volume", vol_lbl, vol_bg, vol_fg)
+
+    // Signal
+    sig_lbl = longTrigger ? "SNIPE NOW" : longWatch ? "WATCH" : exit_sig ? "EXIT" : "WAIT"
+    sig_bg  = longTrigger ? c_yes : exit_sig ? c_no : c_dark
+    sig_fg  = longTrigger ? c_good : longWatch ? c_warn : exit_sig ? c_bad : c_gray
+    f_hrow(8, "SIGNAL", sig_lbl, sig_bg, sig_fg)
+
+    // SL / TP1
+    sl_str  = not na(sl_locked)  ? str.tostring(math.round(sl_locked,  3)) : "--"
+    tp1_str = not na(tp1_locked) ? str.tostring(math.round(tp1_locked, 3)) : "--"
+    tp2_str = not na(tp2_locked) ? str.tostring(math.round(tp2_locked, 3)) : "--"
+    f_hrow(9, "SL / TP1 / TP2", sl_str + " / " + tp1_str + " / " + tp2_str, c_dark, c_orng)
+
+// ============================================================
+// [v7-12] ALERTS — deduplicated, fire once per state change
+// ============================================================
+alertcondition(new_trigger, title="SNIPE Entry",  message="V7 Sniper | {{ticker}} | SNIPE: Daily trend + session + PD cleared. Quality EMA pullback confirmed with volume surge.")
+alertcondition(new_watch,   title="WATCH Setup",  message="V7 Sniper | {{ticker}} | WATCH: All gates pass. Pullback in place. Waiting for volume surge to confirm.")
+alertcondition(new_exit,    title="EXIT Signal",  message="V7 Sniper | {{ticker}} | EXIT: EMA crossunder or PDL broken. Close or protect position.")
+
+// ============================================================
+// END OF SCRIPT
+// ============================================================

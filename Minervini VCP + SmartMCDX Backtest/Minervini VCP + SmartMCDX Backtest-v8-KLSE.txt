@@ -1,0 +1,586 @@
+//@version=6
+// ============================================================
+// Minervini VCP + SmartMCDX Backtest — v8 KLSE Edition
+// Adapted for Bursa Malaysia (KLSE / MYX) market
+//
+// All v7 improvements are retained. KLSE-specific changes:
+//  [KLSE-1]  Benchmark default → MYX:FBMKLCI (was SPY)
+//  [KLSE-2]  Commission → 0.28% (brokerage 0.1% + stamp duty 0.15% + clearing 0.03%)
+//  [KLSE-3]  Initial capital → RM 50,000 (realistic Malaysian retail capital)
+//  [KLSE-4]  52-week lookback → 245 bars (KLSE ~245 trading days/year, more public holidays)
+//  [KLSE-5]  Minimum stock price filter (RM) — removes penny stock noise
+//  [KLSE-6]  Minimum average daily volume filter — liquidity gate for thin KLSE books
+//  [KLSE-7]  VCP squeeze tightness default → 3.0% (was 2.5%; KLSE price action is noisier)
+//  [KLSE-8]  Max base depth default → 40% (was 35%; KLSE corrections tend to be deeper)
+//  [KLSE-9]  Min base duration default → 20 bars (was 15; more time needed to absorb supply)
+//  [KLSE-10] Volume surge multiplier default → 1.3 (was 1.5; KLSE surges are smaller multiples)
+//  [KLSE-11] Fallback hard stop default → 5.0% (was 4.5%; wider spreads + overnight gap risk)
+//  [KLSE-12] Dashboard updated with KLSE branding and liquidity filter status row
+//
+// Bursa Malaysia transaction costs per side (typical online broker):
+//   Brokerage  : 0.10% (min RM 8, e.g. Rakuten Trade / Mplus Online)
+//   Stamp duty : 0.15% (RM 1.50 per RM 1,000, capped RM 1,000 per contract)
+//   Clearing   : 0.03% (Bursa Clearing fee, capped RM 1,000)
+//   TOTAL      : ~0.28% per side
+//
+// NOTE: If you see "Invalid symbol", try these benchmark symbols in order:
+//   1st choice : MYX:FBMKLCI  (FBM KLCI 30 blue-chips — default)
+//   2nd choice : MYX:FBMEMAS  (FBM EMAS — broader market)
+//   3rd choice : MYX:0820EA   (MyETF KLCI — ETF, has volume, tracks KLCI)
+//   Search "KLCI" in TradingView symbol search to confirm what is available.
+//
+// IMPORTANT KLSE NOTES:
+//   • Apply only to Main Market stocks — ACE Market stocks are more speculative
+//   • Avoid PN17 / GN3 distressed stocks (check Bursa website before trading)
+//   • Contra trading (T+2) can cause artificial volume spikes — treat with caution
+//   • Minimum lot size is 100 shares; position sizing approximated here
+//   • MYR currency — all RM values in this script are in Ringgit
+// ============================================================
+strategy(
+  'Minervini VCP + SmartMCDX KLSE v8',
+  overlay               = true,
+  max_lines_count       = 500,
+  max_labels_count      = 500,
+  initial_capital       = 50000,                        // [KLSE-3] RM 50,000
+  default_qty_type      = strategy.percent_of_equity,
+  default_qty_value     = 100,
+  commission_type       = strategy.commission.percent,
+  commission_value      = 0.28,                         // [KLSE-2] Bursa Malaysia realistic cost
+  slippage              = 3)                            // 3-tick slippage (wider spreads on KLSE)
+
+// ==========================================
+// 1. INPUTS
+// ==========================================
+grp_strat = '1. Strategy & Risk Management'
+
+req_tpr       = input.bool(true,  'Require Full TPR (7/7) for Entry',           group=grp_strat)
+req_vcp       = input.bool(false, 'Require VCP Squeeze for Entry',               group=grp_strat)
+req_vol_surge = input.bool(true,  'Require Volume Surge on Breakout',             group=grp_strat)
+vol_mult      = input.float(1.3,  'Volume Surge Multiplier',       step=0.1,     group=grp_strat)  // [KLSE-10]
+
+// Breakout confirmation buffer
+bo_buffer_pct = input.float(0.3,  '[v7] Breakout Buffer % Above Line', step=0.1, group=grp_strat) / 100
+
+// Stop loss
+use_atr_stop  = input.bool(true,  '[v7] Use ATR-Based Stop Loss',                group=grp_strat)
+atr_sl_mult   = input.float(2.0,  '[v7] ATR Stop Multiplier',         step=0.1,  group=grp_strat)
+sl_pct        = input.float(5.0,  'Fallback Hard Stop Loss %',         step=0.5,  group=grp_strat) / 100  // [KLSE-11]
+
+// Hybrid Target & Break-Even
+use_partial_tp  = input.bool(true,  'Take Partial Profit (Sell 50% at TP1)',      group=grp_strat)
+partial_tp_pct  = input.float(5.0,  'TP1 Target %',                   step=0.5,  group=grp_strat) / 100
+use_partial_tp2 = input.bool(true,  '[v7] Runner Limit at TP2',                   group=grp_strat)
+partial_tp2_pct = input.float(10.0, '[v7] TP2 Target %',              step=1.0,  group=grp_strat) / 100
+use_breakeven   = input.bool(true,  'Move Stop to Break-Even',                    group=grp_strat)
+be_trigger_pct  = input.float(4.0,  'Break-Even Trigger %',           step=0.5,  group=grp_strat) / 100
+use_trail       = input.bool(true,  'Use 21-EMA Trailing Stop for Runner',         group=grp_strat)
+trail_activation = input.float(3.0, 'Activate Trail After % Profit',  step=1.0,  group=grp_strat) / 100
+
+// Base quality gates
+min_base_bars    = input.int(20,  '[KLSE] Min Base Duration (Bars)', minval=5,    group=grp_strat)  // [KLSE-9]
+req_contractions = input.bool(true, '[v7] Require Min VCP Contractions',           group=grp_strat)
+min_contractions = input.int(2,   '[v7] Min Contractions in Base', minval=1, maxval=5, group=grp_strat)
+
+// ─── [KLSE-5] [KLSE-6] Bursa Malaysia Liquidity Gates ───────────────────────
+// KLSE has many illiquid and speculative stocks. These filters protect against:
+//   • Penny stocks (sub-RM 0.50) where spread % is huge and manipulation is rife
+//   • Thin-volume stocks where a single trade moves the price significantly
+grp_klse         = '2. KLSE Liquidity Filters'
+min_price_rm     = input.float(0.50,   '[KLSE] Min Stock Price (RM)',   step=0.05,  group=grp_klse)
+min_avg_vol      = input.int(200000,   '[KLSE] Min Avg Daily Volume (shares)', step=50000, group=grp_klse)
+// ─────────────────────────────────────────────────────────────────────────────
+
+// MCDX Smart Money
+grp_mcdx       = '3. MCDX Smart Money Filter'
+use_mcdx_entry = input.bool(false, 'Require Banker for Entry',                   group=grp_mcdx)
+mcdx_entry_val = input.float(0.0,  'Min Banker % for Entry',         step=10.0,  group=grp_mcdx)
+use_mcdx_exit  = input.bool(false, 'Smart Exit: Sell if Banker Drops',           group=grp_mcdx)
+mcdx_exit_val  = input.float(0.0,  'Exit Danger Threshold %',        step=5.0,   group=grp_mcdx)
+
+// Market Regime & Relative Strength
+grp_regime     = '4. Market Regime & Relative Strength'
+use_mkt_regime = input.bool(true, '[v7] Require Bull Market (FBM KLCI > 200 SMA)', group=grp_regime)
+use_rs_filter  = input.bool(true, '[v7] Require Stock Outperforms FBM KLCI',        group=grp_regime)
+rs_period      = input.int(63,    '[v7] RS Lookback Period (Bars)', minval=20,       group=grp_regime)
+// [KLSE-1] Default benchmark changed from SPY to FBM KLCI
+// Verify this symbol on TradingView: search "FBM KLCI" and use the exact symbol shown
+bm_sym         = input.symbol('MYX:FBMKLCI', '[KLSE] Benchmark Symbol (FBM KLCI)', group=grp_regime)
+
+// Moving Averages
+grp_ma     = '5. Moving Averages'
+len_ema21  = input.int(21,  '21 EMA Length',  group=grp_ma)
+len_sma50  = input.int(50,  '50 SMA Length',  group=grp_ma)
+len_sma150 = input.int(150, '150 SMA Length', group=grp_ma)
+len_sma200 = input.int(200, '200 SMA Length', group=grp_ma)
+c_ema21    = input.color(color.new(color.yellow, 50), '21 EMA Color', group=grp_ma)
+c_sma50    = input.color(color.blue,   '50 SMA Color',  group=grp_ma)
+c_sma150   = input.color(color.orange, '150 SMA Color', group=grp_ma)
+c_sma200   = input.color(color.red,    '200 SMA Color', group=grp_ma)
+
+// Table Display
+grp_display     = '6. Table Display'
+table_pos_input = input.string('Top Left', 'Table Position',
+  options=['Top Left','Top Center','Top Right','Middle Left','Middle Center',
+           'Middle Right','Bottom Left','Bottom Center','Bottom Right'],
+  group=grp_display)
+table_size_input = input.string('Small', 'Table Size',
+  options=['Tiny','Small','Normal','Large','Huge'], group=grp_display)
+// ── Optional dashboard rows — disable any to slim the table ──────────────
+show_tpr_detail    = input.bool(false, 'Dashboard: TPR Condition Breakdown (C1–C7)', group=grp_display)
+show_regime_row    = input.bool(true,  'Dashboard: FBM KLCI Regime Row',             group=grp_display)
+show_rs_row        = input.bool(true,  'Dashboard: RS vs KLCI Row',                  group=grp_display)
+show_liquidity_row = input.bool(true,  'Dashboard: KLSE Liquidity Row',              group=grp_display)
+show_vcp_row       = input.bool(true,  'Dashboard: VCP Squeeze Row',                 group=grp_display)
+show_mcdx_row      = input.bool(true,  'Dashboard: MCDX / OBV Row',                  group=grp_display)
+
+// Base & Trendline
+grp_base      = '7. Base & Trendline Settings'
+h1_lookback   = input.int(21,    'H1 Lookback (Bars)', minval=1,        group=grp_base)
+h_pivot_left  = input.int(3,     'Sub-High Left Bars',  minval=1,       group=grp_base)
+h_pivot_right = input.int(3,     'Sub-High Right Bars', minval=1,       group=grp_base)
+// [KLSE-8] Max base depth 40% (was 35%) — KLSE corrections are typically deeper
+max_depth_pct = input.float(40.0, '[KLSE] Max Base Depth %', minval=1.0, maxval=80.0, step=1.0, group=grp_base) / 100
+keep_latest   = input.bool(true,  'Show Only Latest Line per Anchor',    group=grp_base)
+
+// VCP
+grp_vcp             = '8. Signals & VCP'
+// [KLSE-7] VCP tightness 3.0% (was 2.5%) — KLSE price action is noisier on thin books
+vcp_thresh          = input.float(3.0, '[KLSE] VCP Squeeze Tightness %', step=0.1,  group=grp_vcp)
+req_vol_contraction = input.bool(true, 'Require Volume Contraction for VCP',         group=grp_vcp)
+
+// ==========================================
+// 2. CALCULATIONS & INDICATORS
+// ==========================================
+ema21  = ta.ema(close, len_ema21)
+sma50  = ta.sma(close, len_sma50)
+sma150 = ta.sma(close, len_sma150)
+sma200 = ta.sma(close, len_sma200)
+atr14  = ta.atr(14)
+
+plot(ema21,  '21 EMA',  color=c_ema21,  linewidth=1)
+plot(sma50,  '50 SMA',  color=c_sma50,  linewidth=2)
+plot(sma150, '150 SMA', color=c_sma150, linewidth=2)
+plot(sma200, '200 SMA', color=c_sma200, linewidth=2)
+
+// MCDX Proxy: RSI(50) + MFI(14) composite
+mcdx_rsi      = ta.rsi(close, 50)
+mcdx_mfi      = ta.mfi(hlc3, 14)
+banker_raw    = ((mcdx_rsi - 50) * 3) + ((mcdx_mfi - 50) * 2)
+banker_red    = math.max(0, math.min(100, banker_raw))
+banker_smooth = ta.ema(banker_red, 5)
+
+// OBV trend — institutional accumulation signal
+obv        = ta.obv
+obv_ma     = ta.sma(obv, 20)
+obv_rising = obv > obv_ma
+
+// [KLSE-4] Minervini 7-Condition Trend Template
+// KLSE has ~245 trading days/year (more public holidays than US).
+// Using 245 bars for 52-week high/low lookback.
+klse_annual_bars = 245  // [KLSE-4]
+enough_bars = bar_index >= klse_annual_bars
+high_52wk   = ta.highest(high, klse_annual_bars)
+low_52wk    = ta.lowest(low,   klse_annual_bars)
+
+c1 = close > sma150 and close > sma200
+c2 = sma150 > sma200
+c3 = sma200 > sma200[20]
+c4 = sma50 > sma150 and sma50 > sma200
+c5 = close > sma50
+c6 = enough_bars and close > low_52wk  * 1.25
+c7 = enough_bars and close > high_52wk * 0.75
+
+tpr_pass  = c1 and c2 and c3 and c4 and c5 and c6 and c7
+tpr_score = (c1 ? 1 : 0) + (c2 ? 1 : 0) + (c3 ? 1 : 0) + (c4 ? 1 : 0) + (c5 ? 1 : 0) + (c6 ? 1 : 0) + (c7 ? 1 : 0)
+
+// VCP Squeeze — 10-bar lookback
+vcp_highest   = ta.highest(high, 10)
+vcp_lowest    = ta.lowest(low,  10)
+vcp_range_pct = (vcp_highest - vcp_lowest) / close * 100
+vol_ma        = ta.sma(volume, 10)
+vol_dry       = volume < vol_ma * 0.8
+vcp_squeeze   = vcp_range_pct < vcp_thresh and (not req_vol_contraction or vol_dry)
+
+// [KLSE-1] Market Regime via FBM KLCI
+// If MYX:FBMKLCI gives "Invalid symbol", change bm_sym input to MYX:FBMEMAS or MYX:0820EA
+klci_close     = request.security(bm_sym, timeframe.period, close)
+klci_sma200    = request.security(bm_sym, timeframe.period, ta.sma(close, 200))
+market_is_bull = use_mkt_regime ? (not na(klci_sma200) and klci_close > klci_sma200) : true
+
+// Relative Strength vs FBM KLCI
+stock_return = not na(close[rs_period])      ? (close / close[rs_period])           : na
+klci_return  = not na(klci_close[rs_period]) ? (klci_close / klci_close[rs_period]) : na
+rs_pass      = use_rs_filter
+              ? (not na(stock_return) and not na(klci_return) and stock_return > klci_return)
+              : true
+
+// [KLSE-5] Price filter — prevents entries in sub-RM penny stocks
+//   Below RM 0.50: bid-ask spread often >1%, VCP signals are unreliable
+price_ok = close >= min_price_rm
+
+// [KLSE-6] Volume liquidity filter — 50-bar average volume must meet minimum
+//   Thin stocks (< 200k avg volume) cause slippage that makes signals unprofitable
+avg_vol_50        = ta.sma(volume, 50)
+vol_liquidity_ok  = avg_vol_50 >= min_avg_vol
+
+// ==========================================
+// 3. TABLE COLORS
+// Solid dark backgrounds — readable on both light and dark chart themes
+// ==========================================
+c_bg_hdr  = color.new(#5c0000,    0)   // header: deep red/maroon
+c_bg_lbl  = color.new(#0d1f3c,    0)   // label column: dark navy
+c_bg_good = color.new(#0a3d0a,    0)   // pass: dark green
+c_bg_warn = color.new(#4a3000,    0)   // warning: dark amber
+c_bg_bad  = color.new(#3d0a0a,    0)   // fail: dark red
+c_bg_neu  = color.new(#2a2a3a,    0)   // neutral: dark slate
+c_txt     = color.white                 // all status text: white
+c_txt_lbl = color.new(#b0b8d0,    0)   // label text: light blue-gray
+
+// ==========================================
+// 4. BASE & TRENDLINE STATE
+// ==========================================
+var float base_h1_price  = na
+var int   base_h1_idx    = na
+var float base_low_price = na
+var int   base_low_idx   = na
+var int   contraction_count = 0
+
+var active_lines   = array.new_line()
+var active_origins = array.new_int()
+var anchor_indices = array.new_int()
+var anchor_prices  = array.new_float()
+var anchor_lows    = array.new_float()
+var int last_conn_idx = na
+
+is_potential_h1 = high > ta.highest(high, h1_lookback)[1] and close > sma200
+
+if is_potential_h1
+    if na(base_h1_price) or high > base_h1_price
+        if array.size(active_lines) > 0
+            for i = 0 to array.size(active_lines) - 1
+                line.set_x2(array.get(active_lines, i), bar_index)
+        base_h1_price     := high
+        base_h1_idx       := bar_index
+        base_low_price    := low
+        base_low_idx      := bar_index
+        contraction_count := 0
+        array.clear(active_lines)
+        array.clear(active_origins)
+        array.clear(anchor_indices)
+        array.clear(anchor_prices)
+        array.clear(anchor_lows)
+        last_conn_idx := bar_index
+        array.push(anchor_indices, bar_index)
+        array.push(anchor_prices, high)
+        array.push(anchor_lows, low)
+
+if not na(base_h1_price)
+    if low < base_low_price
+        base_low_price := low
+        base_low_idx   := bar_index
+
+    if array.size(anchor_indices) > 1
+        for i = array.size(anchor_indices) - 1 to 1
+            float floor   = array.get(anchor_lows, i)
+            int   anc_idx = array.get(anchor_indices, i)
+            if low < floor
+                if array.size(active_lines) > 0
+                    for k = array.size(active_lines) - 1 to 0
+                        if array.get(active_origins, k) == anc_idx
+                            line.delete(array.get(active_lines, k))
+                            array.remove(active_lines, k)
+                            array.remove(active_origins, k)
+                array.remove(anchor_indices, i)
+                array.remove(anchor_prices, i)
+                array.remove(anchor_lows, i)
+            else
+                array.set(anchor_lows, i, math.min(floor, low))
+
+    if (base_h1_price - base_low_price) / base_h1_price > max_depth_pct
+        base_h1_price     := na
+        contraction_count := 0
+        array.clear(active_lines)
+        array.clear(active_origins)
+        array.clear(anchor_indices)
+
+pivot_floor_val = ta.lowest(low, h_pivot_right)
+ph = ta.pivothigh(high, h_pivot_left, h_pivot_right)
+
+if not na(ph) and not na(base_h1_price)
+    int  ph_idx        = bar_index[h_pivot_right]
+    bool is_right_side = ph_idx > base_low_idx
+
+    if ph_idx > last_conn_idx and ph < base_h1_price and ph > base_low_price and is_right_side
+        if array.size(anchor_indices) > 0
+            for i = 0 to array.size(anchor_indices) - 1
+                int   anc_idx     = array.get(anchor_indices, i)
+                float anc_pri     = array.get(anchor_prices, i)
+                bool anchor_valid = (anc_idx == base_h1_idx) or (anc_idx > base_low_idx)
+
+                if ph < anc_pri and ph_idx > anc_idx and anchor_valid
+                    bool  path_is_clear   = true
+                    float potential_slope = (ph - anc_pri) / (ph_idx - anc_idx)
+                    int   start_scan      = anc_idx == base_h1_idx ? math.max(base_low_idx, anc_idx + 1) : anc_idx + 1
+
+                    for k = start_scan to ph_idx - 1
+                        int   offset        = bar_index - k
+                        float theoretical_y = anc_pri + potential_slope * (k - anc_idx)
+                        if high[offset] > theoretical_y
+                            path_is_clear := false
+                            break
+
+                    if path_is_clear
+                        if keep_latest and array.size(active_lines) > 0
+                            for j = array.size(active_lines) - 1 to 0
+                                if array.get(active_origins, j) == anc_idx
+                                    line.delete(array.get(active_lines, j))
+                                    array.remove(active_lines, j)
+                                    array.remove(active_origins, j)
+
+                        int   target_x = bar_index + 5
+                        float target_y = anc_pri + potential_slope * (target_x - anc_idx)
+                        newline = line.new(x1=anc_idx, y1=anc_pri, x2=target_x, y2=target_y,
+                          color=color.gray, style=line.style_dotted, width=1)
+                        array.push(active_lines, newline)
+                        array.push(active_origins, anc_idx)
+                        contraction_count += 1
+
+        array.push(anchor_indices, ph_idx)
+        array.push(anchor_prices, ph)
+        array.push(anchor_lows, pivot_floor_val)
+        last_conn_idx := ph_idx
+
+// Base quality checks
+base_duration       = not na(base_h1_idx) ? (bar_index - base_h1_idx) : 0
+base_mature         = base_duration >= min_base_bars
+enough_contractions = req_contractions ? (contraction_count >= min_contractions) : true
+
+// ==========================================
+// 5. LINE BREAKOUT SIGNALS
+// ==========================================
+breakout_signal = false
+
+if array.size(active_lines) > 0
+    for i = array.size(active_lines) - 1 to 0
+        l              = array.get(active_lines, i)
+        float y1       = line.get_y1(l)
+        float y2       = line.get_y2(l)
+        int   x1       = line.get_x1(l)
+        int   x2       = line.get_x2(l)
+        float m        = (y2 - y1) / (x2 - x1)
+        float line_val = y1 + m * (bar_index - x1)
+        float bo_threshold = line_val * (1.0 + bo_buffer_pct)
+
+        if close > bo_threshold
+            breakout_signal := true
+            line.set_color(l, color.new(color.lime, 0))
+            line.set_x2(l, bar_index)
+            line.set_y2(l, line_val)
+            array.remove(active_lines, i)
+            array.remove(active_origins, i)
+        else
+            line.set_x2(l, bar_index + 5)
+            line.set_y2(l, y1 + m * (bar_index + 5 - x1))
+
+plotshape(breakout_signal, 'Breakout Marker', shape.labelup, location.belowbar,
+  color.lime, size=size.tiny, text='BO')
+
+// ==========================================
+// 6. STRATEGY EXECUTION
+// ==========================================
+
+// Volume surge: current bar vs 50-bar average (current bar only — not rolling max)
+vol_surge_cond = req_vol_surge ? (volume > avg_vol_50 * vol_mult) : true
+
+valid_tpr = req_tpr ? tpr_pass : true
+valid_vcp = req_vcp ? vcp_squeeze : true
+
+banker_val      = na(banker_smooth) ? 0 : banker_smooth
+mcdx_entry_cond = use_mcdx_entry ? (banker_val >= mcdx_entry_val) : true
+
+// Full entry gate — all conditions must pass simultaneously
+// Line continuation uses trailing 'and' (operator at end of line, not start of next)
+long_cond = breakout_signal and
+          valid_tpr and
+          valid_vcp and
+          vol_surge_cond and
+          mcdx_entry_cond and
+          market_is_bull and         // FBM KLCI regime [KLSE-1]
+          rs_pass and                // outperforms FBM KLCI [KLSE-1]
+          base_mature and            // min 20-bar base [KLSE-9]
+          enough_contractions and    // min 2 pivot connections
+          price_ok and               // min RM price [KLSE-5]
+          vol_liquidity_ok           // min avg volume [KLSE-6]
+
+if long_cond and strategy.position_size == 0
+    strategy.entry('Long', strategy.long)
+
+// Manual highest-price tracking to prevent the Pine Script "ghost trade" crash
+var float highest_since_entry = na
+if strategy.position_size > 0
+    if strategy.position_size[1] == 0
+        highest_since_entry := high
+    else
+        highest_since_entry := math.max(highest_since_entry, high)
+else
+    highest_since_entry := na
+
+if strategy.position_size > 0
+    entry_p        = strategy.opentrades.entry_price(0)
+    profit_pct     = (close - entry_p) / entry_p
+    max_profit_pct = (highest_since_entry - entry_p) / entry_p
+
+    // ATR-based stop adapts to the stock's actual daily volatility (RM terms)
+    float active_stop = use_atr_stop
+      ? (entry_p - atr14 * atr_sl_mult)
+      : (entry_p * (1 - sl_pct))
+
+    if use_breakeven and max_profit_pct >= be_trigger_pct
+        active_stop := math.max(active_stop, entry_p * 1.002)
+
+    if use_trail and profit_pct >= trail_activation
+        float ema_stop = ema21 * 0.99
+        if ema_stop > active_stop
+            active_stop := ema_stop
+
+    if use_mcdx_exit and banker_val < mcdx_exit_val
+        strategy.close('Long', comment='MCDX Exit')
+
+    tp1_level = entry_p * (1 + partial_tp_pct)
+    tp2_level = entry_p * (1 + partial_tp2_pct)
+
+    if use_partial_tp
+        strategy.exit('Half TP', 'Long', qty_percent=50, limit=tp1_level, stop=active_stop)
+        if use_partial_tp2
+            strategy.exit('Runner', 'Long', limit=tp2_level, stop=active_stop)
+        else
+            strategy.exit('Runner', 'Long', stop=active_stop)
+    else
+        strategy.exit('Full Exit', 'Long', stop=active_stop)
+
+// ==========================================
+// 7. DASHBOARD TABLE  [KLSE-12]
+// ==========================================
+// NOTE: table_pos_input is kept for UX reference only.
+// Pine v6 requires compile-time constants in table.new() — the actual
+// position is hardcoded as position.top_left in the table.new() call below.
+// To relocate the table, edit the literal there, not this input.
+table_sz = switch table_size_input
+    'Tiny'  => size.tiny
+    'Large' => size.large
+    'Huge'  => size.huge
+    =>         size.small
+
+// ── Dynamic row-index wiring ─────────────────────────────────────────────────
+// Always shown: header(0), Minervini TPR(1), ► BUY SIGNAL(last)
+// show_tpr_detail inserts 7 C1–C7 rows immediately after TPR score
+// Each other optional row shifts all rows below it up by 1 when enabled
+r8_tpr    = 1
+r8_c1     = 2
+r8_regime = r8_c1     + (show_tpr_detail    ? 7 : 0)
+r8_rs     = r8_regime + (show_regime_row    ? 1 : 0)
+r8_liq    = r8_rs     + (show_rs_row        ? 1 : 0)
+r8_vcp    = r8_liq    + (show_liquidity_row ? 1 : 0)
+r8_mcdx   = r8_vcp    + (show_vcp_row       ? 1 : 0)
+r8_signal = r8_mcdx   + (show_mcdx_row      ? 1 : 0)
+v8_rows   = r8_signal + 1
+
+// ── DEFINITIVE FIX (Pine v6 + Strategy mode):
+// Moving table.new() INSIDE the if-block (no var keyword) is the only fully
+// reliable approach. Without var, Pine v6 has no const-string/const-int
+// requirement for position and rows. It also fixes a silent strategy-mode
+// failure where var table declarations can fail to render even with hardcoded
+// literals. The table is created once on the last bar — no performance cost.
+// To move the table: change the position.top_left literal in table.new() below.
+//   position.top_left | position.top_center | position.top_right
+//   position.middle_left | position.middle_center | position.middle_right
+//   position.bottom_left | position.bottom_center | position.bottom_right
+if barstate.islast or barstate.isrealtime
+    // force_overlay=true is REQUIRED for strategy() scripts in Pine v6.
+    // Without it, the table is silently dropped — it renders correctly in
+    // indicator() scripts but not in strategy() context.
+    table dash = table.new(position.top_left, 2, 16,
+      bgcolor       = color.new(color.black, 0),
+      border_width  = 1,
+      border_color  = color.new(#3a3a4a, 0),
+      force_overlay = true)
+
+    // ── Header ──────────────────────────────────────────────────────────────
+    table.cell(dash, 0, 0, 'KLSE MSS v8', text_color=c_txt, bgcolor=c_bg_hdr, text_size=table_sz)
+    table.cell(dash, 1, 0, 'STATUS',       text_color=c_txt, bgcolor=c_bg_hdr, text_size=table_sz)
+
+    // ── IS THE TREND TEMPLATE VALID? (always shown) ──────────────────────────
+    tpr_lbl = str.tostring(tpr_score) + ' / 7  ' + (tpr_pass ? 'ALL PASS' : str.tostring(7 - tpr_score) + ' FAIL')
+    table.cell(dash, 0, r8_tpr, 'Minervini TPR', text_color=c_txt_lbl, bgcolor=c_bg_lbl, text_size=table_sz)
+    table.cell(dash, 1, r8_tpr, tpr_lbl, text_color=c_txt, bgcolor=tpr_pass ? c_bg_good : c_bg_warn, text_size=table_sz)
+
+    // ── C1–C7 CONDITION BREAKDOWN (optional — toggle on to diagnose failures) ─
+    if show_tpr_detail
+        table.cell(dash, 0, r8_c1,     'C1 Price>MA150/200', text_color=c_txt_lbl, bgcolor=c_bg_lbl, text_size=table_sz)
+        table.cell(dash, 1, r8_c1,     c1 ? 'PASS' : 'FAIL', text_color=c_txt, bgcolor=c1 ? c_bg_good : c_bg_bad, text_size=table_sz)
+        table.cell(dash, 0, r8_c1 + 1, 'C2 MA150 > MA200',   text_color=c_txt_lbl, bgcolor=c_bg_lbl, text_size=table_sz)
+        table.cell(dash, 1, r8_c1 + 1, c2 ? 'PASS' : 'FAIL', text_color=c_txt, bgcolor=c2 ? c_bg_good : c_bg_bad, text_size=table_sz)
+        table.cell(dash, 0, r8_c1 + 2, 'C3 MA200 Rising',    text_color=c_txt_lbl, bgcolor=c_bg_lbl, text_size=table_sz)
+        table.cell(dash, 1, r8_c1 + 2, c3 ? 'PASS' : 'FAIL', text_color=c_txt, bgcolor=c3 ? c_bg_good : c_bg_bad, text_size=table_sz)
+        table.cell(dash, 0, r8_c1 + 3, 'C4 MA50>MA150/200',  text_color=c_txt_lbl, bgcolor=c_bg_lbl, text_size=table_sz)
+        table.cell(dash, 1, r8_c1 + 3, c4 ? 'PASS' : 'FAIL', text_color=c_txt, bgcolor=c4 ? c_bg_good : c_bg_bad, text_size=table_sz)
+        table.cell(dash, 0, r8_c1 + 4, 'C5 Price > MA50',    text_color=c_txt_lbl, bgcolor=c_bg_lbl, text_size=table_sz)
+        table.cell(dash, 1, r8_c1 + 4, c5 ? 'PASS' : 'FAIL', text_color=c_txt, bgcolor=c5 ? c_bg_good : c_bg_bad, text_size=table_sz)
+        table.cell(dash, 0, r8_c1 + 5, 'C6 25% Off 52w Low', text_color=c_txt_lbl, bgcolor=c_bg_lbl, text_size=table_sz)
+        table.cell(dash, 1, r8_c1 + 5, c6 ? 'PASS' : 'FAIL', text_color=c_txt, bgcolor=c6 ? c_bg_good : c_bg_bad, text_size=table_sz)
+        table.cell(dash, 0, r8_c1 + 6, 'C7 Near 52w High',   text_color=c_txt_lbl, bgcolor=c_bg_lbl, text_size=table_sz)
+        table.cell(dash, 1, r8_c1 + 6, c7 ? 'PASS' : 'FAIL', text_color=c_txt, bgcolor=c7 ? c_bg_good : c_bg_bad, text_size=table_sz)
+
+    // ── IS THE MARKET IN A BULL REGIME? (optional) ───────────────────────────
+    if show_regime_row
+        table.cell(dash, 0, r8_regime, 'FBM KLCI', text_color=c_txt_lbl, bgcolor=c_bg_lbl, text_size=table_sz)
+        table.cell(dash, 1, r8_regime, market_is_bull ? 'BULL' : 'BEAR', text_color=c_txt, bgcolor=market_is_bull ? c_bg_good : c_bg_bad, text_size=table_sz)
+
+    // ── IS THE STOCK OUTPERFORMING THE INDEX? (optional) ────────────────────
+    if show_rs_row
+        table.cell(dash, 0, r8_rs, 'RS vs KLCI', text_color=c_txt_lbl, bgcolor=c_bg_lbl, text_size=table_sz)
+        table.cell(dash, 1, r8_rs, rs_pass ? 'LEADING' : 'LAGGING', text_color=c_txt, bgcolor=rs_pass ? c_bg_good : c_bg_bad, text_size=table_sz)
+
+    // ── IS IT LIQUID ENOUGH TO TRADE ON BURSA? (optional) ───────────────────
+    if show_liquidity_row
+        liq_ok  = price_ok and vol_liquidity_ok
+        liq_str = 'RM ' + str.tostring(math.round(close, 2)) + '  |  ' + str.tostring(math.round(avg_vol_50 / 1000, 0)) + 'k'
+        table.cell(dash, 0, r8_liq, 'Liquidity', text_color=c_txt_lbl, bgcolor=c_bg_lbl, text_size=table_sz)
+        table.cell(dash, 1, r8_liq, liq_str, text_color=c_txt, bgcolor=liq_ok ? c_bg_good : c_bg_bad, text_size=table_sz)
+
+    // ── IS PRICE IN A VCP COIL? (optional) ──────────────────────────────────
+    if show_vcp_row
+        table.cell(dash, 0, r8_vcp, 'VCP Squeeze', text_color=c_txt_lbl, bgcolor=c_bg_lbl, text_size=table_sz)
+        table.cell(dash, 1, r8_vcp, vcp_squeeze ? 'TIGHT' : 'LOOSE', text_color=c_txt, bgcolor=vcp_squeeze ? c_bg_good : c_bg_warn, text_size=table_sz)
+
+    // ── IS SMART MONEY ACCUMULATING? (optional) ──────────────────────────────
+    if show_mcdx_row
+        mcdx_str = str.tostring(math.round(banker_val, 0)) + '%  ' + (obv_rising ? 'OBV +' : 'OBV -')
+        table.cell(dash, 0, r8_mcdx, 'MCDX | OBV', text_color=c_txt_lbl, bgcolor=c_bg_lbl, text_size=table_sz)
+        table.cell(dash, 1, r8_mcdx, mcdx_str, text_color=c_txt, bgcolor=banker_val >= 50 and obv_rising ? c_bg_good : c_bg_neu, text_size=table_sz)
+
+    // ── BUY NOW? (always shown — the final decision row) ────────────────────
+    sig_bg  = long_cond ? c_bg_good : tpr_score >= 5 ? c_bg_warn : c_bg_neu
+    sig_txt = long_cond ? '► BUY' : tpr_score >= 5 ? 'SETUP' : 'WAIT'
+    table.cell(dash, 0, r8_signal, '► BUY SIGNAL', text_color=c_txt_lbl, bgcolor=c_bg_lbl, text_size=table_sz)
+    table.cell(dash, 1, r8_signal, sig_txt, text_color=c_txt, bgcolor=sig_bg, text_size=table_sz)
+
+// ==========================================
+// 8. VISUAL SIGNS
+// ==========================================
+var float current_pos = 0.0
+current_pos := strategy.position_size
+
+bool is_buy  = current_pos > 0 and current_pos[1] == 0
+bool is_tp   = current_pos > 0 and current_pos < current_pos[1]
+bool is_exit = current_pos == 0 and current_pos[1] > 0
+
+plotshape(is_buy,  title='BUY Tag',  style=shape.labelup,   location=location.belowbar,
+  color=color.blue,   text='BUY',  textcolor=color.white, size=size.small)
+plotshape(is_tp,   title='TP Tag',   style=shape.labeldown, location=location.abovebar,
+  color=color.orange, text='TP',   textcolor=color.white, size=size.small)
+plotshape(is_exit, title='EXIT Tag', style=shape.labeldown, location=location.abovebar,
+  color=color.red,    text='EXIT', textcolor=color.white, size=size.small)
+
+// Teal tint on bars where all 7 Trend Template conditions pass
+barcolor(tpr_pass ? color.new(color.teal, 88) : na, title='TPR Pass Highlight')

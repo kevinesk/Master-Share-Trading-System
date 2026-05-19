@@ -1,0 +1,518 @@
+//@version=6
+// ============================================================
+// Minervini VCP + SmartMCDX Backtest — v7
+// Changes vs v6:
+//  [v7-1]  Commission 0.1% + slippage 2 ticks added (realistic backtest)
+//  [v7-2]  Market regime filter: SPY must be above its 200 SMA
+//  [v7-3]  Relative Strength filter: stock must outperform SPY over RS period
+//  [v7-4]  Breakout confirmation buffer: close must be N% above trendline
+//  [v7-5]  Volume surge: current bar only (was 3-day rolling max — stale)
+//  [v7-6]  Minimum base duration check before allowing entry
+//  [v7-7]  VCP contraction count — require min N pivot connections
+//  [v7-8]  ATR-based dynamic stop loss (replaces fixed %)
+//  [v7-9]  MCDX proxy upgraded: RSI(50) + MFI(14) composite
+//  [v7-10] Banker smoothing changed from SMA to EMA (less lag)
+//  [v7-11] OBV trend shown in dashboard as accumulation signal
+//  [v7-12] VCP squeeze lookback extended from 5 → 10 bars
+//  [v7-13] Dashboard table actually built and rendered
+//  [v7-14] TPR score displayed as X/7 with per-condition detail
+//  [v7-15] Second partial TP level for runner position
+//  [v7-16] Volume surge multiplier default raised 1.0 → 1.5
+// ============================================================
+strategy(
+  'Minervini VCP + SmartMCDX Backtest v7',
+  overlay               = true,
+  max_lines_count       = 500,
+  max_labels_count      = 500,
+  initial_capital       = 10000,
+  default_qty_type      = strategy.percent_of_equity,
+  default_qty_value     = 100,
+  commission_type       = strategy.commission.percent,  // [v7-1]
+  commission_value      = 0.1,                          // [v7-1] 0.1% per side
+  slippage              = 2)                            // [v7-1] 2-tick slippage
+
+// ==========================================
+// 1. INPUTS
+// ==========================================
+grp_strat = '1. Strategy & Risk Management'
+
+req_tpr       = input.bool(true,  'Require Full TPR (7/7) for Entry',           group=grp_strat)
+req_vcp       = input.bool(false, 'Require VCP Squeeze for Entry',               group=grp_strat)
+req_vol_surge = input.bool(true,  'Require Volume Surge on Breakout',             group=grp_strat)
+vol_mult      = input.float(1.5,  'Volume Surge Multiplier',       step=0.1,     group=grp_strat)  // [v7-16] was 1.0
+
+// [v7-4] Breakout confirmation buffer
+bo_buffer_pct = input.float(0.3,  '[v7] Breakout Buffer % Above Line', step=0.1, group=grp_strat) / 100
+
+// [v7-8] Stop loss mode
+use_atr_stop  = input.bool(true,  '[v7] Use ATR-Based Stop Loss',                group=grp_strat)
+atr_sl_mult   = input.float(2.0,  '[v7] ATR Stop Multiplier',         step=0.1,  group=grp_strat)
+sl_pct        = input.float(4.5,  'Fallback Hard Stop Loss %',         step=0.5,  group=grp_strat) / 100
+
+// Hybrid Target & Break-Even
+use_partial_tp  = input.bool(true,  'Take Partial Profit (Sell 50% at TP1)',     group=grp_strat)
+partial_tp_pct  = input.float(5.0,  'TP1 Target %',                   step=0.5,  group=grp_strat) / 100
+use_partial_tp2 = input.bool(true,  '[v7] Runner Limit at TP2',                  group=grp_strat)  // [v7-15]
+partial_tp2_pct = input.float(10.0, '[v7] TP2 Target %',              step=1.0,  group=grp_strat) / 100  // [v7-15]
+use_breakeven   = input.bool(true,  'Move Stop to Break-Even',                   group=grp_strat)
+be_trigger_pct  = input.float(4.0,  'Break-Even Trigger %',           step=0.5,  group=grp_strat) / 100
+use_trail       = input.bool(true,  'Use 21-EMA Trailing Stop for Runner',        group=grp_strat)
+trail_activation = input.float(3.0, 'Activate Trail After % Profit',  step=1.0,  group=grp_strat) / 100
+
+// [v7-6] Base quality gates
+min_base_bars    = input.int(15, '[v7] Min Base Duration (Bars)', minval=5,       group=grp_strat)
+// [v7-7] VCP contraction gate
+req_contractions = input.bool(true, '[v7] Require Min VCP Contractions',          group=grp_strat)
+min_contractions = input.int(2,  '[v7] Min Contractions in Base', minval=1, maxval=5, group=grp_strat)
+
+// MCDX Smart Money
+grp_mcdx       = '2. MCDX Smart Money Filter'
+use_mcdx_entry = input.bool(false, 'Require Banker for Entry',                   group=grp_mcdx)
+mcdx_entry_val = input.float(0.0,  'Min Banker % for Entry',         step=10.0,  group=grp_mcdx)
+use_mcdx_exit  = input.bool(false, 'Smart Exit: Sell if Banker Drops',           group=grp_mcdx)
+mcdx_exit_val  = input.float(0.0,  'Exit Danger Threshold %',        step=5.0,   group=grp_mcdx)
+
+// [v7-2] [v7-3] Market Regime & Relative Strength
+grp_regime     = '3. Market Regime & Relative Strength'
+use_mkt_regime = input.bool(true, '[v7] Require Bull Market (SPY > 200 SMA)',     group=grp_regime)
+use_rs_filter  = input.bool(true, '[v7] Require Stock Outperforms SPY',           group=grp_regime)
+rs_period      = input.int(63,    '[v7] RS Lookback Period (Bars)', minval=20,    group=grp_regime)
+bm_sym         = input.symbol('SPY', 'Benchmark Symbol',                          group=grp_regime)
+
+// Moving Averages
+grp_ma     = '4. Moving Averages'
+len_ema21  = input.int(21,  '21 EMA Length',  group=grp_ma)
+len_sma50  = input.int(50,  '50 SMA Length',  group=grp_ma)
+len_sma150 = input.int(150, '150 SMA Length', group=grp_ma)
+len_sma200 = input.int(200, '200 SMA Length', group=grp_ma)
+c_ema21    = input.color(color.new(color.yellow, 50), '21 EMA Color', group=grp_ma)
+c_sma50    = input.color(color.blue,   '50 SMA Color',  group=grp_ma)
+c_sma150   = input.color(color.orange, '150 SMA Color', group=grp_ma)
+c_sma200   = input.color(color.red,    '200 SMA Color', group=grp_ma)
+
+// [v7-13] Table Display
+grp_display     = '5. Table Display'
+table_pos_input = input.string('Top Right', 'Table Position',
+  options=['Top Left','Top Center','Top Right','Middle Left','Middle Center',
+           'Middle Right','Bottom Left','Bottom Center','Bottom Right'],
+  group=grp_display)
+table_size_input = input.string('Small', 'Table Size',
+  options=['Tiny','Small','Normal','Large','Huge'], group=grp_display)
+
+// Base & Trendline
+grp_base      = '6. Base & Trendline Settings'
+h1_lookback   = input.int(21,   'H1 Lookback (Bars)', minval=1,         group=grp_base)
+h_pivot_left  = input.int(3,    'Sub-High Left Bars',  minval=1,        group=grp_base)
+h_pivot_right = input.int(3,    'Sub-High Right Bars', minval=1,        group=grp_base)
+max_depth_pct = input.float(35.0, 'Max Base Depth %', minval=1.0, maxval=80.0, step=1.0, group=grp_base) / 100
+keep_latest   = input.bool(true, 'Show Only Latest Line per Anchor',     group=grp_base)
+
+// VCP
+grp_vcp             = '7. Signals & VCP'
+vcp_thresh          = input.float(2.5, 'VCP Squeeze Tightness %', step=0.1, group=grp_vcp)
+req_vol_contraction = input.bool(true, 'Require Volume Contraction for VCP',   group=grp_vcp)
+
+// ==========================================
+// 2. CALCULATIONS & INDICATORS
+// ==========================================
+ema21  = ta.ema(close, len_ema21)
+sma50  = ta.sma(close, len_sma50)
+sma150 = ta.sma(close, len_sma150)
+sma200 = ta.sma(close, len_sma200)
+atr14  = ta.atr(14)  // [v7-8]
+
+plot(ema21,  '21 EMA',  color=c_ema21,  linewidth=1)
+plot(sma50,  '50 SMA',  color=c_sma50,  linewidth=2)
+plot(sma150, '150 SMA', color=c_sma150, linewidth=2)
+plot(sma200, '200 SMA', color=c_sma200, linewidth=2)
+
+// [v7-9] MCDX Proxy: RSI(50) + MFI(14) composite — more robust than RSI alone
+// RSI captures price momentum; MFI adds volume-weighted money flow pressure
+mcdx_rsi     = ta.rsi(close, 50)
+mcdx_mfi     = ta.mfi(hlc3, 14)
+banker_raw   = ((mcdx_rsi - 50) * 3) + ((mcdx_mfi - 50) * 2)
+banker_red   = math.max(0, math.min(100, banker_raw))
+banker_smooth = ta.ema(banker_red, 5)  // [v7-10] EMA instead of SMA for less lag
+
+// [v7-11] OBV trend — rising OBV above its MA signals institutional accumulation
+obv        = ta.obv
+obv_ma     = ta.sma(obv, 20)
+obv_rising = obv > obv_ma
+
+// --- Minervini 7-Condition Trend Template ---
+enough_bars = bar_index >= 252
+high_52wk   = ta.highest(high, 252)
+low_52wk    = ta.lowest(low,  252)
+
+c1 = close > sma150 and close > sma200
+c2 = sma150 > sma200
+c3 = sma200 > sma200[20]
+c4 = sma50 > sma150 and sma50 > sma200
+c5 = close > sma50
+c6 = enough_bars and close > low_52wk  * 1.25
+c7 = enough_bars and close > high_52wk * 0.75
+
+tpr_pass  = c1 and c2 and c3 and c4 and c5 and c6 and c7
+// [v7-14] Score each condition individually for dashboard display
+tpr_score = (c1 ? 1 : 0) + (c2 ? 1 : 0) + (c3 ? 1 : 0) + (c4 ? 1 : 0) + (c5 ? 1 : 0) + (c6 ? 1 : 0) + (c7 ? 1 : 0)
+
+// [v7-12] VCP squeeze: extended to 10-bar lookback (was 5) for better coiling confirmation
+vcp_highest   = ta.highest(high, 10)
+vcp_lowest    = ta.lowest(low,  10)
+vcp_range_pct = (vcp_highest - vcp_lowest) / close * 100
+vol_ma        = ta.sma(volume, 10)
+vol_dry       = volume < vol_ma * 0.8
+vcp_squeeze   = vcp_range_pct < vcp_thresh and (not req_vol_contraction or vol_dry)
+
+// [v7-2] Market regime: benchmark must be in uptrend above its 200 SMA
+spy_close      = request.security(bm_sym, timeframe.period, close)
+spy_sma200     = request.security(bm_sym, timeframe.period, ta.sma(close, 200))
+market_is_bull = use_mkt_regime ? (not na(spy_sma200) and spy_close > spy_sma200) : true
+
+// [v7-3] Relative Strength: stock return vs benchmark return over rs_period bars
+stock_return = not na(close[rs_period]) ? (close / close[rs_period]) : na
+spy_return   = not na(spy_close[rs_period]) ? (spy_close / spy_close[rs_period]) : na
+rs_pass      = use_rs_filter ? (not na(stock_return) and not na(spy_return) and stock_return > spy_return) : true
+
+// ==========================================
+// 3. TABLE COLORS
+// ==========================================
+c_good    = color.green
+c_warn    = color.yellow
+c_bad     = color.new(color.red, 10)
+
+// ==========================================
+// 4. BASE & TRENDLINE STATE
+// ==========================================
+var float base_h1_price  = na
+var int   base_h1_idx    = na
+var float base_low_price = na
+var int   base_low_idx   = na
+var int   contraction_count = 0  // [v7-7] pivot connections drawn inside this base
+
+var active_lines   = array.new_line()
+var active_origins = array.new_int()
+var anchor_indices = array.new_int()
+var anchor_prices  = array.new_float()
+var anchor_lows    = array.new_float()
+var int last_conn_idx = na
+
+is_potential_h1 = high > ta.highest(high, h1_lookback)[1] and close > sma200
+
+if is_potential_h1
+    if na(base_h1_price) or high > base_h1_price
+        if array.size(active_lines) > 0
+            for i = 0 to array.size(active_lines) - 1
+                line.set_x2(array.get(active_lines, i), bar_index)
+        base_h1_price     := high
+        base_h1_idx       := bar_index
+        base_low_price    := low
+        base_low_idx      := bar_index
+        contraction_count := 0  // [v7-7] reset count for new base
+        array.clear(active_lines)
+        array.clear(active_origins)
+        array.clear(anchor_indices)
+        array.clear(anchor_prices)
+        array.clear(anchor_lows)
+        last_conn_idx := bar_index
+        array.push(anchor_indices, bar_index)
+        array.push(anchor_prices, high)
+        array.push(anchor_lows, low)
+
+if not na(base_h1_price)
+    if low < base_low_price
+        base_low_price := low
+        base_low_idx   := bar_index
+
+    if array.size(anchor_indices) > 1
+        for i = array.size(anchor_indices) - 1 to 1
+            float floor   = array.get(anchor_lows, i)
+            int   anc_idx = array.get(anchor_indices, i)
+            if low < floor
+                if array.size(active_lines) > 0
+                    for k = array.size(active_lines) - 1 to 0
+                        if array.get(active_origins, k) == anc_idx
+                            line.delete(array.get(active_lines, k))
+                            array.remove(active_lines, k)
+                            array.remove(active_origins, k)
+                array.remove(anchor_indices, i)
+                array.remove(anchor_prices, i)
+                array.remove(anchor_lows, i)
+            else
+                array.set(anchor_lows, i, math.min(floor, low))
+
+    if (base_h1_price - base_low_price) / base_h1_price > max_depth_pct
+        base_h1_price     := na
+        contraction_count := 0  // [v7-7] reset on invalidation
+        array.clear(active_lines)
+        array.clear(active_origins)
+        array.clear(anchor_indices)
+
+pivot_floor_val = ta.lowest(low, h_pivot_right)
+ph = ta.pivothigh(high, h_pivot_left, h_pivot_right)
+
+if not na(ph) and not na(base_h1_price)
+    int  ph_idx        = bar_index[h_pivot_right]
+    bool is_right_side = ph_idx > base_low_idx
+
+    if ph_idx > last_conn_idx and ph < base_h1_price and ph > base_low_price and is_right_side
+        if array.size(anchor_indices) > 0
+            for i = 0 to array.size(anchor_indices) - 1
+                int   anc_idx     = array.get(anchor_indices, i)
+                float anc_pri     = array.get(anchor_prices, i)
+                bool anchor_valid = (anc_idx == base_h1_idx) or (anc_idx > base_low_idx)
+
+                if ph < anc_pri and ph_idx > anc_idx and anchor_valid
+                    bool  path_is_clear   = true
+                    float potential_slope = (ph - anc_pri) / (ph_idx - anc_idx)
+                    int   start_scan      = anc_idx == base_h1_idx ? math.max(base_low_idx, anc_idx + 1) : anc_idx + 1
+
+                    for k = start_scan to ph_idx - 1
+                        int   offset        = bar_index - k
+                        float theoretical_y = anc_pri + potential_slope * (k - anc_idx)
+                        if high[offset] > theoretical_y
+                            path_is_clear := false
+                            break
+
+                    if path_is_clear
+                        if keep_latest and array.size(active_lines) > 0
+                            for j = array.size(active_lines) - 1 to 0
+                                if array.get(active_origins, j) == anc_idx
+                                    line.delete(array.get(active_lines, j))
+                                    array.remove(active_lines, j)
+                                    array.remove(active_origins, j)
+
+                        int   target_x = bar_index + 5
+                        float target_y = anc_pri + potential_slope * (target_x - anc_idx)
+                        newline = line.new(x1=anc_idx, y1=anc_pri, x2=target_x, y2=target_y,
+                          color=color.gray, style=line.style_dotted, width=1)
+                        array.push(active_lines, newline)
+                        array.push(active_origins, anc_idx)
+                        contraction_count += 1  // [v7-7] valid trendline drawn = one contraction confirmed
+
+        array.push(anchor_indices, ph_idx)
+        array.push(anchor_prices, ph)
+        array.push(anchor_lows, pivot_floor_val)
+        last_conn_idx := ph_idx
+
+// [v7-6] Base quality checks
+base_duration       = not na(base_h1_idx) ? (bar_index - base_h1_idx) : 0
+base_mature         = base_duration >= min_base_bars
+// [v7-7] Contraction gate (only active when req_contractions = true)
+enough_contractions = req_contractions ? (contraction_count >= min_contractions) : true
+
+// ==========================================
+// 5. LINE BREAKOUT SIGNALS
+// ==========================================
+breakout_signal = false
+
+if array.size(active_lines) > 0
+    for i = array.size(active_lines) - 1 to 0
+        l             = array.get(active_lines, i)
+        float y1      = line.get_y1(l)
+        float y2      = line.get_y2(l)
+        int   x1      = line.get_x1(l)
+        int   x2      = line.get_x2(l)
+        float m       = (y2 - y1) / (x2 - x1)
+        float line_val = y1 + m * (bar_index - x1)
+        // [v7-4] Close must exceed line by buffer % — filters single-bar fakeouts
+        float bo_threshold = line_val * (1.0 + bo_buffer_pct)
+
+        if close > bo_threshold
+            breakout_signal := true
+            line.set_color(l, color.new(color.lime, 0))
+            line.set_x2(l, bar_index)
+            line.set_y2(l, line_val)
+            array.remove(active_lines, i)
+            array.remove(active_origins, i)
+        else
+            line.set_x2(l, bar_index + 5)
+            line.set_y2(l, y1 + m * (bar_index + 5 - x1))
+
+plotshape(breakout_signal, 'Breakout Marker', shape.labelup, location.belowbar,
+  color.lime, size=size.tiny, text='BO')
+
+// ==========================================
+// 6. STRATEGY EXECUTION
+// ==========================================
+
+// [v7-5] Volume surge: current bar's volume vs 50-bar average
+// v6 used highest_vol_3d (3-day rolling max) which was stale — the surge may
+// have happened 2 bars ago, not on the actual breakout bar
+avg_vol_50     = ta.sma(volume, 50)
+vol_surge_cond = req_vol_surge ? (volume > avg_vol_50 * vol_mult) : true
+
+valid_tpr = req_tpr ? tpr_pass : true
+valid_vcp = req_vcp ? vcp_squeeze : true
+
+banker_val      = na(banker_smooth) ? 0 : banker_smooth
+mcdx_entry_cond = use_mcdx_entry ? (banker_val >= mcdx_entry_val) : true
+
+// All conditions must pass simultaneously
+long_cond = breakout_signal and
+          valid_tpr and
+          valid_vcp and
+          vol_surge_cond and
+          mcdx_entry_cond and
+          market_is_bull and        // [v7-2]
+          rs_pass and               // [v7-3]
+          base_mature and           // [v7-6]
+          enough_contractions       // [v7-7]
+
+if long_cond and strategy.position_size == 0
+    strategy.entry('Long', strategy.long)
+
+// Manual highest-price tracking to prevent the Pine Script "ghost trade" crash
+var float highest_since_entry = na
+if strategy.position_size > 0
+    if strategy.position_size[1] == 0
+        highest_since_entry := high
+    else
+        highest_since_entry := math.max(highest_since_entry, high)
+else
+    highest_since_entry := na
+
+if strategy.position_size > 0
+    entry_p        = strategy.opentrades.entry_price(0)
+    profit_pct     = (close - entry_p) / entry_p
+    max_profit_pct = (highest_since_entry - entry_p) / entry_p
+
+    // [v7-8] ATR-based stop: adapts to the stock's current volatility.
+    // Falls back to fixed % if ATR stop is disabled.
+    float active_stop = use_atr_stop
+      ? (entry_p - atr14 * atr_sl_mult)
+      : (entry_p * (1 - sl_pct))
+
+    if use_breakeven and max_profit_pct >= be_trigger_pct
+        active_stop := math.max(active_stop, entry_p * 1.002)
+
+    if use_trail and profit_pct >= trail_activation
+        float ema_stop = ema21 * 0.99
+        if ema_stop > active_stop
+            active_stop := ema_stop
+
+    if use_mcdx_exit and banker_val < mcdx_exit_val
+        strategy.close('Long', comment='MCDX Exit')
+
+    tp1_level = entry_p * (1 + partial_tp_pct)
+    tp2_level = entry_p * (1 + partial_tp2_pct)
+
+    // [v7-15] Two-stage exit:
+    //   TP1 → sell 50% at first target (e.g. +5%)
+    //   Runner → held until TP2 limit (e.g. +10%) OR stop is hit
+    //   If TP2 is disabled, runner is managed by trailing stop only
+    if use_partial_tp
+        strategy.exit('Half TP', 'Long', qty_percent=50, limit=tp1_level, stop=active_stop)
+        if use_partial_tp2
+            strategy.exit('Runner', 'Long', limit=tp2_level, stop=active_stop)
+        else
+            strategy.exit('Runner', 'Long', stop=active_stop)
+    else
+        strategy.exit('Full Exit', 'Long', stop=active_stop)
+
+// ==========================================
+// 7. DASHBOARD TABLE  [v7-13]
+// v6 had table inputs but rendered nothing. This table now shows every
+// condition in real time so the user can see exactly what is passing/failing.
+// ==========================================
+table_pos = switch table_pos_input
+    'Top Left'      => position.top_left
+    'Top Center'    => position.top_center
+    'Middle Left'   => position.middle_left
+    'Middle Center' => position.middle_center
+    'Middle Right'  => position.middle_right
+    'Bottom Left'   => position.bottom_left
+    'Bottom Center' => position.bottom_center
+    'Bottom Right'  => position.bottom_right
+    =>                 position.top_right
+
+table_sz = switch table_size_input
+    'Tiny'  => size.tiny
+    'Large' => size.large
+    'Huge'  => size.huge
+    =>         size.small
+
+var table dash = table.new(
+  table_pos, 2, 14,
+  bgcolor      = color.new(color.black, 65),
+  border_width = 1,
+  border_color = color.new(color.gray, 55))
+
+if barstate.islast or barstate.isrealtime
+    // Header
+    table.cell(dash, 0, 0, 'MINERVINI v7',  text_color=color.white,
+      bgcolor=color.new(color.navy, 25), text_size=table_sz)
+    table.cell(dash, 1, 0, 'STATUS',        text_color=color.white,
+      bgcolor=color.new(color.navy, 25), text_size=table_sz)
+
+    // [v7-14] TPR score as X/7 plus each sub-condition
+    table.cell(dash, 0, 1,  'TPR Score',        text_color=color.silver, text_size=table_sz)
+    table.cell(dash, 1, 1,  str.tostring(tpr_score) + ' / 7',
+      text_color=tpr_pass ? c_good : c_warn, text_size=table_sz)
+
+    table.cell(dash, 0, 2,  'C1  Price>MA150/200', text_color=color.silver, text_size=table_sz)
+    table.cell(dash, 1, 2,  c1 ? 'PASS' : 'FAIL',  text_color=c1 ? c_good : c_bad, text_size=table_sz)
+
+    table.cell(dash, 0, 3,  'C2  MA150>MA200',     text_color=color.silver, text_size=table_sz)
+    table.cell(dash, 1, 3,  c2 ? 'PASS' : 'FAIL',  text_color=c2 ? c_good : c_bad, text_size=table_sz)
+
+    table.cell(dash, 0, 4,  'C3  MA200 Rising',    text_color=color.silver, text_size=table_sz)
+    table.cell(dash, 1, 4,  c3 ? 'PASS' : 'FAIL',  text_color=c3 ? c_good : c_bad, text_size=table_sz)
+
+    table.cell(dash, 0, 5,  'C4  MA50>MA150/200',  text_color=color.silver, text_size=table_sz)
+    table.cell(dash, 1, 5,  c4 ? 'PASS' : 'FAIL',  text_color=c4 ? c_good : c_bad, text_size=table_sz)
+
+    table.cell(dash, 0, 6,  'C5  Price>MA50',      text_color=color.silver, text_size=table_sz)
+    table.cell(dash, 1, 6,  c5 ? 'PASS' : 'FAIL',  text_color=c5 ? c_good : c_bad, text_size=table_sz)
+
+    table.cell(dash, 0, 7,  'C6  25% Off 52w Low', text_color=color.silver, text_size=table_sz)
+    table.cell(dash, 1, 7,  c6 ? 'PASS' : 'FAIL',  text_color=c6 ? c_good : c_bad, text_size=table_sz)
+
+    table.cell(dash, 0, 8,  'C7  Near 52w High',   text_color=color.silver, text_size=table_sz)
+    table.cell(dash, 1, 8,  c7 ? 'PASS' : 'FAIL',  text_color=c7 ? c_good : c_bad, text_size=table_sz)
+
+    // Market filters
+    table.cell(dash, 0, 9,  'Market (SPY)',         text_color=color.silver, text_size=table_sz)
+    table.cell(dash, 1, 9,  market_is_bull ? 'BULL' : 'BEAR',
+      text_color=market_is_bull ? c_good : c_bad, text_size=table_sz)
+
+    table.cell(dash, 0, 10, 'RS vs SPY',            text_color=color.silver, text_size=table_sz)
+    table.cell(dash, 1, 10, rs_pass ? 'LEADING' : 'LAGGING',
+      text_color=rs_pass ? c_good : c_bad, text_size=table_sz)
+
+    // VCP / Base quality
+    table.cell(dash, 0, 11, 'VCP Squeeze',          text_color=color.silver, text_size=table_sz)
+    table.cell(dash, 1, 11, vcp_squeeze ? 'TIGHT' : 'LOOSE',
+      text_color=vcp_squeeze ? c_good : c_warn, text_size=table_sz)
+
+    table.cell(dash, 0, 12, 'Contractions / Base',  text_color=color.silver, text_size=table_sz)
+    table.cell(dash, 1, 12,
+      str.tostring(contraction_count) + ' ctrs  ' + str.tostring(base_duration) + 'b',
+      text_color=enough_contractions and base_mature ? c_good : c_warn, text_size=table_sz)
+
+    // MCDX + OBV
+    table.cell(dash, 0, 13, 'MCDX  OBV',            text_color=color.silver, text_size=table_sz)
+    table.cell(dash, 1, 13,
+      str.tostring(math.round(banker_val, 1)) + '%  ' + (obv_rising ? 'OBV+' : 'OBV-'),
+      text_color=banker_val >= 50 and obv_rising ? c_good : c_warn, text_size=table_sz)
+
+// ==========================================
+// 8. VISUAL SIGNS FOR ENTRIES & EXITS
+// ==========================================
+var float current_pos = 0.0
+current_pos := strategy.position_size
+
+bool is_buy  = current_pos > 0 and current_pos[1] == 0
+bool is_tp   = current_pos > 0 and current_pos < current_pos[1]
+bool is_exit = current_pos == 0 and current_pos[1] > 0
+
+plotshape(is_buy,  title='BUY Tag',  style=shape.labelup,   location=location.belowbar,
+  color=color.blue,   text='BUY',  textcolor=color.white, size=size.small)
+plotshape(is_tp,   title='TP Tag',   style=shape.labeldown, location=location.abovebar,
+  color=color.orange, text='TP',   textcolor=color.white, size=size.small)
+plotshape(is_exit, title='EXIT Tag', style=shape.labeldown, location=location.abovebar,
+  color=color.red,    text='EXIT', textcolor=color.white, size=size.small)
+
+// Subtle teal tint on bars where the full Trend Template is passing
+// Gives a quick visual of when a stock is in the right setup zone
+barcolor(tpr_pass ? color.new(color.teal, 88) : na, title='TPR Pass Highlight')

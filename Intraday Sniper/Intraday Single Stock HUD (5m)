@@ -1,0 +1,57 @@
+//@version=5
+indicator("V6 Intraday Single Stock HUD (5m)", overlay=true)
+
+// =====================================================
+// 🧠 INTRADAY CORE LOGIC (5-Minute Precision)
+// =====================================================
+vwap = ta.vwap
+ema9 = ta.ema(close, 9)
+ema20 = ta.ema(close, 20)
+
+// 1. Trend Identification (The ultimate intraday truth)
+bullTrend = close >= vwap and ema9 > ema20
+// Let's make the text smarter so it tells you exactly what is wrong:
+trendText = close < vwap ? "BELOW VWAP" : (ema9 <= ema20 ? "EMA CROSS DOWN" : "BULLISH")
+trendCol = close < vwap ? color.red : (ema9 <= ema20 ? color.orange : color.lime)
+
+// 2. Location Engine (Are we chasing or waiting?)
+// Calculates how far the price has stretched away from the 9 EMA
+distFromEma = (close - ema9) / ema9 * 100
+
+// If price is more than 0.8% away from the 9 EMA on a 5m chart, it is exhausted/chasing
+isExtended = distFromEma > 0.8 
+// If price is resting near the 9 EMA/VWAP but still above the 20 EMA, it is coiled
+isPullback = close >= ema20 and distFromEma <= 0.8 and distFromEma >= -0.2
+
+locationText = isExtended ? "EXTENDED" : (isPullback ? "PULLBACK" : "CHOPPING")
+locationCol = isExtended ? color.gray : (isPullback ? color.yellow : color.red)
+
+// 3. Action & Volume Filter
+volSurge = volume > ta.sma(volume, 20) * 1.5
+
+// The ultimate execution requires Trend + Pullback + Volume Surge
+action = bullTrend and isPullback and volSurge ? "EXECUTE" : (bullTrend and isPullback ? "SETUP READY" : (bullTrend ? "IN PLAY" : "AVOID"))
+actionCol = action == "EXECUTE" ? color.blue : (action == "SETUP READY" ? color.lime : (action == "IN PLAY" ? color.yellow : color.gray))
+
+// =====================================================
+// 🖥️ MINIMALIST HUD DASHBOARD
+// =====================================================
+var table hud = table.new(position.top_right, 4, 2, border_width=1, bgcolor=color.rgb(20, 20, 20), border_color=color.gray)
+
+if barstate.islast
+    // Headers (Compact Size)
+    table.cell(hud, 0, 0, "SYMBOL", text_color=color.white, text_size=size.small, bgcolor=color.blue)
+    table.cell(hud, 1, 0, "TREND", text_color=color.white, text_size=size.small, bgcolor=color.blue)
+    table.cell(hud, 2, 0, "LOCATION", text_color=color.white, text_size=size.small, bgcolor=color.blue)
+    table.cell(hud, 3, 0, "ACTION", text_color=color.white, text_size=size.small, bgcolor=color.blue)
+    
+    // Live Data
+    table.cell(hud, 0, 1, syminfo.ticker, text_color=color.white, text_size=size.small)
+    table.cell(hud, 1, 1, trendText, text_color=trendCol, text_size=size.small)
+    table.cell(hud, 2, 1, locationText, text_color=locationCol, text_size=size.small)
+    table.cell(hud, 3, 1, action, text_color=actionCol, text_size=size.small)
+    // =====================================================
+// 🔔 INTRADAY ALERTS
+// =====================================================
+alertcondition(action == "EXECUTE", title="🚀 EXECUTE: Volume Bounce", message="Sniper Trigger! Volume surge bouncing off VWAP. Check Moomoo.")
+alertcondition(action == "SETUP READY", title="👀 WATCH: VWAP Pullback", message="Stock is resting on the VWAP line. Get ready for volume.")

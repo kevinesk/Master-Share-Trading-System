@@ -1,0 +1,383 @@
+//@version=5
+indicator("V7 Intraday Single Stock HUD (5m)", overlay=true, max_lines_count=10)
+
+// ============================================================
+// INPUTS
+// ============================================================
+grp_mtf  = "Multi-Timeframe Anchors"
+grp_filt = "Filters & Thresholds"
+grp_disp = "Display"
+grp_risk = "Risk Levels"
+
+idx       = input.symbol("MYX:FBMKLCI", "Market Index (True RS)", group=grp_mtf)
+trendTF   = input.timeframe("D",  "Daily Trend Timeframe",        group=grp_mtf)
+use_rs    = input.bool(true,  "Filter: True RS vs KLCI",          group=grp_mtf)
+
+ext_pct   = input.float(0.8, "Extended threshold (% from EMA9)", minval=0.1, maxval=3.0, step=0.1, group=grp_filt)
+vol_mult  = input.float(1.5, "Volume surge multiplier",           minval=1.0, maxval=5.0, step=0.1, group=grp_filt)
+ema9_len  = input.int(9,  "Fast EMA length",  minval=2,  maxval=50,  group=grp_filt)
+ema20_len = input.int(20, "Slow EMA length",  minval=5,  maxval=100, group=grp_filt)
+min_price = input.float(0.50, "KLSE Min Price (RM)",  minval=0.01,  group=grp_filt)
+min_vol   = input.int(200000, "KLSE Min Avg Volume",  minval=1000,  group=grp_filt)
+sess_warn = input.bool(true,  "Warn: Opening/Closing 30-min noise", group=grp_filt)
+
+show_sl   = input.bool(true,  "Show ATR Stop-Loss line",   group=grp_risk)
+atr_sl    = input.float(1.5,  "ATR SL multiplier",         minval=0.5, maxval=5.0, step=0.1, group=grp_risk)
+atr_tp    = input.float(3.0,  "ATR TP multiplier",         minval=0.5, maxval=10.0, step=0.1, group=grp_risk)
+
+hudPosStr = input.string("Top Right", "HUD Position",
+             options=["Top Left","Top Center","Top Right","Bottom Left","Bottom Center","Bottom Right"],
+             group=grp_disp)
+show_mcdx = input.bool(true, "Show MCDX row",   group=grp_disp)
+show_risk = input.bool(true, "Show SL/TP row",  group=grp_disp)
+
+// ============================================================
+// COLOURS
+// ============================================================
+c_good  = color.new(#00C851, 0)
+c_warn  = color.new(#FFD600, 0)
+c_bad   = color.new(#FF4444, 0)
+c_blue  = color.new(#2196F3, 0)
+c_aqua  = color.new(#00BCD4, 0)
+c_gray  = color.new(#9E9E9E, 0)
+c_orng  = color.new(#FF9800, 0)
+c_hdr   = color.new(#1A237E, 0)
+c_bg    = color.new(#0D0D0D, 0)
+c_white = color.new(#FFFFFF, 0)
+
+// ============================================================
+// [v7-1] LAYER 0 — KLSE LIQUIDITY GATE (daily-anchored)
+// Bug fix: 5m bar volume is tiny — using it for the liquidity
+// gate caused false THIN reads on stocks with 3M+ daily volume.
+// d_avg_vol pulls the 20-day SMA of volume from the Daily TF.
+// avgVol (5m) is kept for vol_surge detection on the current bar.
+// ============================================================
+avgVol      = ta.sma(volume, 20)
+d_avg_vol   = request.security(syminfo.tickerid, "D", ta.sma(volume, 20), lookahead=barmerge.lookahead_off)
+liquidityOk = close >= min_price and d_avg_vol >= min_vol
+
+// ============================================================
+// [v7-2] LAYER 1 — DAILY TREND ANCHOR (via request.security)
+// ============================================================
+f_daily_trend() =>
+    _e50  = ta.ema(close, 50)
+    _e150 = ta.ema(close, 150)
+    _e200 = ta.ema(close, 200)
+    not na(_e50) and not na(_e150) and not na(_e200) and close > _e200 and _e50 > _e150 and _e150 > _e200
+
+dailyTrend = request.security(syminfo.tickerid, trendTF, f_daily_trend(), lookahead=barmerge.lookahead_off)
+
+// ============================================================
+// [v7-3] LAYER 2 — TRUE RS vs FBMKLCI
+// ============================================================
+idxClose = request.security(idx, timeframe.period, close, lookahead=barmerge.lookahead_off)
+trueRS   = close / idxClose
+strongRS = trueRS > ta.sma(trueRS, 50)
+rsPass   = use_rs ? strongRS : true
+
+// ============================================================
+// LAYER 3 — INTRADAY CORE (5-Minute Precision)
+// ============================================================
+vwap  = ta.vwap(hlc3)
+ema9  = ta.ema(close, ema9_len)
+ema20 = ta.ema(close, ema20_len)
+
+aboveVwap    = close > vwap
+intradayBull = ema9 > ema20 and close > ema20
+
+// [v7-4] Distance engine — configurable threshold
+distFromEma9 = (close - ema9) / ema9 * 100
+isExtended   = distFromEma9 > ext_pct
+isPullback   = aboveVwap and intradayBull and distFromEma9 <= ext_pct and distFromEma9 >= -(ext_pct * 0.5)
+isChopping   = aboveVwap and not intradayBull
+isReclaiming = not aboveVwap and intradayBull
+
+// Full intraday trend text
+var string trendText = "AVOID"
+if aboveVwap and intradayBull
+    trendText := "BULLISH"
+else if aboveVwap and not intradayBull
+    trendText := "VWAP CHOP"
+else if not aboveVwap and intradayBull
+    trendText := "RECLAIMING"
+else
+    trendText := "BEARISH"
+
+var color trendCol = c_bad
+if aboveVwap and intradayBull
+    trendCol := c_good
+else if aboveVwap and not intradayBull
+    trendCol := c_warn
+else if not aboveVwap and intradayBull
+    trendCol := c_orng
+else
+    trendCol := c_bad
+
+// Location label
+// ── State map ─────────────────────────────────────────────────────────────
+// EXTENDED   : above VWAP + bull EMAs + price > +ext_pct% above EMA9
+// PULLBACK   : above VWAP + bull EMAs + price within -(ext_pct×0.5)% of EMA9  ← SNIPE zone
+// TOO DEEP   : above VWAP + bull EMAs + price < -(ext_pct×0.5)% below EMA9   ← wait for bounce
+// CHOPPING   : above VWAP but EMA9 < EMA20 (EMAs bearish despite VWAP position)
+// RECLAIMING : below VWAP but EMAs still bullish (fighting to reclaim VWAP)
+// BELOW VWAP : below VWAP + EMAs bearish — avoid
+// ─────────────────────────────────────────────────────────────────────────
+isTooDeep = aboveVwap and intradayBull and distFromEma9 < -(ext_pct * 0.5)
+
+var string locationText = "BELOW VWAP"
+if isExtended
+    locationText := "EXTENDED"
+else if isPullback
+    locationText := "PULLBACK"
+else if isTooDeep
+    locationText := "TOO DEEP"
+else if isChopping
+    locationText := "CHOPPING"
+else if isReclaiming
+    locationText := "RECLAIMING"
+else
+    locationText := "BELOW VWAP"
+
+var color locationCol = c_bad
+if isExtended
+    locationCol := c_gray
+else if isPullback
+    locationCol := c_aqua
+else if isTooDeep
+    locationCol := c_warn   // amber — above VWAP but EMA9 pullback too deep
+else if isChopping
+    locationCol := c_warn
+else if isReclaiming
+    locationCol := c_orng
+else
+    locationCol := c_bad
+
+// ============================================================
+// [v7-5] LAYER 4 — VOLUME + MCDX SMART MONEY
+// ============================================================
+volSurge = volume > avgVol * vol_mult
+volFade  = volume < avgVol * 0.6
+
+// [v7-10] MCDX proxy: RSI(14)+MFI(14) composite (−100 to +100 scale)
+rsi14  = ta.rsi(close, 14)
+mfi14  = ta.mfi(hlc3, 14)
+mcdx   = ((rsi14 - 50) * 3) + ((mfi14 - 50) * 2)
+mcdxBull = mcdx > 0
+
+// OBV trend
+obvVal  = ta.obv
+obvBull = obvVal > ta.sma(obvVal, 20)
+
+// ============================================================
+// [v7-6] SESSION AWARENESS — Official Bursa Malaysia hours (MYT = UTC+8)
+//   Morning continuous : 09:00 – 12:30
+//   Lunch break        : 12:30 – 14:30  (pre-open from 14:00)
+//   Afternoon          : 14:30 – 16:45
+//   Pre-closing        : 16:45 – 17:00
+// Noise blocked: first 30min open | full lunch | pre-closing auction
+//
+// BUG FIX: time() returns na (NOT 0) for bars outside the session string.
+// The old pattern  (time(...) == 0 ? false : true)  was ALWAYS evaluating
+// to true because:  na == 0  →  false  →  ternary took the else branch → true.
+// Result: every single bar was flagged as NOISY regardless of actual time.
+// Correct idiom: not na(time(...))
+//   • Inside session  → time() = timestamp (not na) → not na = true  ✓
+//   • Outside session → time() = na             → not na = false ✓
+// ============================================================
+inOpeningNoise  = sess_warn and not na(time(timeframe.period, "0900-0930"))
+inLunchNoise    = sess_warn and not na(time(timeframe.period, "1230-1430"))
+inClosingNoise  = sess_warn and not na(time(timeframe.period, "1645-1700"))
+sessionNoise    = inOpeningNoise or inLunchNoise or inClosingNoise
+
+// Session noise background tint — faint red overlay during blocked zones
+// (mirrors the Sniper's red tint so the HUD also works standalone)
+bgcolor(sessionNoise ? color.new(#FF5252, 96) : na, title="Session noise tint")
+
+// ============================================================
+// [v7-7] ACTION ENGINE — 5 states
+// ============================================================
+// SNIPE  = daily trend + RS + intraday bull + VWAP pullback + vol surge + liquidity
+// EXECUTE= daily trend + RS + intraday bull + vol surge + liquidity (not at pullback)
+// SETUP  = daily trend + RS + intraday bull (no vol surge yet)
+// IN PLAY= intraday bull only (no daily context or RS)
+// AVOID  = none of the above
+
+stratValid = dailyTrend and rsPass and liquidityOk
+
+isSnipe   = stratValid and intradayBull and isPullback and volSurge and not sessionNoise
+isExecute = stratValid and intradayBull and aboveVwap  and volSurge and not isPullback and not isExtended and not sessionNoise
+isSetup   = stratValid and intradayBull and aboveVwap  and not volSurge
+isInPlay  = intradayBull and aboveVwap and not stratValid
+
+var string action = "AVOID"
+if isSnipe
+    action := "SNIPE"
+else if isExecute
+    action := "EXECUTE"
+else if isSetup
+    action := "SETUP"
+else if isInPlay
+    action := "IN PLAY"
+else
+    action := "AVOID"
+
+var color actionCol = c_gray
+if isSnipe
+    actionCol := c_blue
+else if isExecute
+    actionCol := c_good
+else if isSetup
+    actionCol := c_warn
+else if isInPlay
+    actionCol := c_orng
+else
+    actionCol := c_gray
+
+// ============================================================
+// [v7-8] ATR-BASED SL/TP
+// ============================================================
+atrVal = ta.atr(14)
+
+var float slLevel = na
+var float tpLevel = na
+var float entryRef = na
+
+// Capture entry reference on SNIPE or EXECUTE trigger
+new_snipe   = isSnipe   and not isSnipe[1]
+new_execute = isExecute and not isExecute[1]
+
+if new_snipe or new_execute
+    entryRef := close
+    slLevel  := close - atrVal * atr_sl
+    tpLevel  := close + atrVal * atr_tp
+
+// Auto-reset when price hits SL or TP
+if not na(slLevel) and (close < slLevel or close > tpLevel)
+    slLevel  := na
+    tpLevel  := na
+    entryRef := na
+
+// Plot SL/TP
+plot(show_sl and not na(slLevel) ? slLevel : na, "Stop Loss", color=c_bad,  linewidth=1, style=plot.style_linebr)
+plot(show_sl and not na(tpLevel) ? tpLevel : na, "Take Profit", color=c_good, linewidth=1, style=plot.style_linebr)
+
+// ============================================================
+// VISUAL AIDS
+// ============================================================
+plot(ema9,  "EMA Fast", color=color.new(color.red,    20), linewidth=1)
+plot(ema20, "EMA Slow", color=color.new(color.orange,  20), linewidth=1)
+plot(vwap,  "VWAP", color=color.new(color.aqua, 20), linewidth=1, style=plot.style_circles)
+
+bgcolor(isPullback and stratValid ? color.new(color.lime, 92) : na, title="Pullback zone highlight")
+
+// [v7-12] Bar coloring by action state
+var color bc = color.new(color.gray, 90)
+if isSnipe
+    bc := color.new(color.blue,  70)
+else if isExecute
+    bc := color.new(color.lime,  75)
+else if isSetup
+    bc := color.new(color.yellow, 80)
+else if isInPlay
+    bc := color.new(color.orange, 85)
+else
+    bc := color.new(color.gray, 90)
+
+barcolor(bc, title="Action barcolor")
+
+// Entry signal shapes
+plotshape(new_snipe,   "SNIPE",   shape.labelup, location.belowbar, color=c_blue, text="SNIPE",   textcolor=c_white, size=size.small)
+plotshape(new_execute, "EXECUTE", shape.labelup, location.belowbar, color=c_good, text="EXECUTE", textcolor=c_white, size=size.small)
+
+// ============================================================
+// [v7-9] HUD POSITION (switch → compile-time constant)
+// ============================================================
+hudPos = switch hudPosStr
+    "Top Left"      => position.top_left
+    "Top Center"    => position.top_center
+    "Top Right"     => position.top_right
+    "Bottom Left"   => position.bottom_left
+    "Bottom Center" => position.bottom_center
+    => position.bottom_right
+
+// ============================================================
+// [v7-14] HUD TABLE — 3 rows: header | values | context numbers
+// Dynamic rows based on show_mcdx / show_risk
+// ============================================================
+r_hdr    = 0
+r_val    = 1
+r_mcdx   = 2
+r_risk   = r_mcdx + (show_mcdx ? 1 : 0)
+r_ctx    = r_risk + (show_risk ? 1 : 0)
+hud_rows = r_ctx  + 1
+
+var table hud = table.new(position.top_right, 5, 5, border_width=1, bgcolor=c_bg, border_color=color.new(color.gray, 60))
+
+if barstate.islast or barstate.isrealtime
+    // Row 0: Headers
+    table.cell(hud, 0, r_hdr, "SYMBOL",   text_color=c_white, text_size=size.small, bgcolor=c_hdr)
+    table.cell(hud, 1, r_hdr, "DAILY",    text_color=c_white, text_size=size.small, bgcolor=c_hdr)
+    table.cell(hud, 2, r_hdr, "INTRADAY", text_color=c_white, text_size=size.small, bgcolor=c_hdr)
+    table.cell(hud, 3, r_hdr, "LOCATION", text_color=c_white, text_size=size.small, bgcolor=c_hdr)
+    table.cell(hud, 4, r_hdr, "ACTION",   text_color=c_white, text_size=size.small, bgcolor=c_hdr)
+
+    // Row 1: Live values
+    table.cell(hud, 0, r_val, syminfo.ticker, text_color=c_white, text_size=size.small, bgcolor=c_bg)
+    table.cell(hud, 1, r_val, dailyTrend ? "PASS" : "FAIL", text_color=dailyTrend ? c_good : c_bad, text_size=size.small, bgcolor=c_bg)
+    table.cell(hud, 2, r_val, trendText, text_color=trendCol, text_size=size.small, bgcolor=c_bg)
+    table.cell(hud, 3, r_val, locationText, text_color=locationCol, text_size=size.small, bgcolor=c_bg)
+    table.cell(hud, 4, r_val, action, text_color=actionCol, text_size=size.small, bgcolor=c_bg)
+
+    // Optional Row: MCDX + OBV + RS + Liquidity
+    if show_mcdx
+        mcdxStr = str.tostring(math.round(mcdx)) + " | " + (mcdxBull ? "BULL" : "BEAR")
+        obvStr  = obvBull ? "OBV↑" : "OBV↓"
+        rsStr   = use_rs ? (strongRS ? "RS LEAD" : "RS LAG") : "RS OFF"
+        liqStr  = liquidityOk ? "LIQ OK" : "THIN"
+        table.cell(hud, 0, r_mcdx, "MCDX",  text_color=c_white, text_size=size.tiny, bgcolor=c_hdr)
+        table.cell(hud, 1, r_mcdx, mcdxStr, text_color=mcdxBull ? c_good : c_bad, text_size=size.tiny, bgcolor=c_bg)
+        table.cell(hud, 2, r_mcdx, obvStr,  text_color=obvBull ? c_good : c_bad,  text_size=size.tiny, bgcolor=c_bg)
+        table.cell(hud, 3, r_mcdx, rsStr,   text_color=strongRS ? c_good : c_bad,  text_size=size.tiny, bgcolor=c_bg)
+        table.cell(hud, 4, r_mcdx, liqStr,  text_color=liquidityOk ? c_good : c_bad, text_size=size.tiny, bgcolor=c_bg)
+
+    // Optional Row: SL / TP context
+    if show_risk
+        slStr = not na(slLevel) ? "SL " + str.tostring(math.round(slLevel, 3)) : "SL —"
+        tpStr = not na(tpLevel) ? "TP " + str.tostring(math.round(tpLevel, 3)) : "TP —"
+        noiseStr = sessionNoise ? "NOISY" : "CLEAN"
+        volStr = volSurge ? "VOL↑" : (volFade ? "VOL↓" : "VOL~")
+        table.cell(hud, 0, r_risk, "RISK",    text_color=c_white, text_size=size.tiny, bgcolor=c_hdr)
+        table.cell(hud, 1, r_risk, slStr,     text_color=c_bad,   text_size=size.tiny, bgcolor=c_bg)
+        table.cell(hud, 2, r_risk, tpStr,     text_color=c_good,  text_size=size.tiny, bgcolor=c_bg)
+        table.cell(hud, 3, r_risk, volStr,    text_color=volSurge ? c_good : (volFade ? c_bad : c_gray), text_size=size.tiny, bgcolor=c_bg)
+        table.cell(hud, 4, r_risk, noiseStr,  text_color=sessionNoise ? c_warn : c_gray, text_size=size.tiny, bgcolor=c_bg)
+
+    // Context numbers row (always shown)
+    distStr = str.tostring(math.round(distFromEma9, 2)) + "% EMA"
+    pxStr   = str.tostring(math.round(close, 3))
+    vwapStr = str.tostring(math.round(vwap, 3))
+    avgVStr = str.tostring(math.round(avgVol / 1000, 0)) + "k"
+    table.cell(hud, 0, r_ctx, "PRICE",   text_color=c_white, text_size=size.tiny, bgcolor=c_hdr)
+    table.cell(hud, 1, r_ctx, pxStr,     text_color=c_white, text_size=size.tiny, bgcolor=c_bg)
+    table.cell(hud, 2, r_ctx, "VWAP",    text_color=c_white, text_size=size.tiny, bgcolor=c_hdr)
+    table.cell(hud, 3, r_ctx, vwapStr,   text_color=aboveVwap ? c_good : c_bad, text_size=size.tiny, bgcolor=c_bg)
+    table.cell(hud, 4, r_ctx, distStr,   text_color=isExtended ? c_bad : (isPullback ? c_aqua : c_gray), text_size=size.tiny, bgcolor=c_bg)
+
+// ============================================================
+// [v7-2] ALERTS — deduplicated (fire once on first bar)
+// ============================================================
+alertcondition(new_snipe,
+     "🎯 SNIPE: Perfect 5m Entry",
+     "{{ticker}} — SNIPE: Daily trend + RS + VWAP pullback + volume surge. Ideal intraday entry.")
+
+alertcondition(new_execute,
+     "🚀 EXECUTE: 5m Volume Breakout",
+     "{{ticker}} — EXECUTE: Daily trend confirmed. Strong volume above VWAP. Enter now.")
+
+alertcondition(isSetup and not isSetup[1],
+     "👀 SETUP: 5m Ready to Trigger",
+     "{{ticker}} — SETUP: Daily trend + RS confirmed. Watching for volume surge.")
+
+alertcondition(sessionNoise and (isSnipe or isExecute),
+     "⚠️ NOISE WARNING",
+     "{{ticker}} — Signal during opening/closing 30min. Confirm before entry.")

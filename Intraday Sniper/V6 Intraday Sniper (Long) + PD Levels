@@ -1,0 +1,48 @@
+//@version=6
+indicator("V6 Intraday Sniper (Long) + PD Levels", overlay=true)
+
+// =====================================================
+// 📅 PREVIOUS DAY LEVELS (PDH, PDL, PDC)
+// =====================================================
+// Pulls Daily data without repainting issues on intraday charts
+[pdh, pdl, pdc] = request.security(syminfo.tickerid, "D", [high[1], low[1], close[1]], lookahead=barmerge.lookahead_on)
+
+// Plot the levels as subtle dashed lines
+plot(pdh, title="Prev Day High", color=color.new(color.lime, 50), style=plot.style_circles, linewidth=1)
+plot(pdl, title="Prev Day Low", color=color.new(color.red, 50), style=plot.style_circles, linewidth=1)
+plot(pdc, title="Prev Day Close", color=color.new(color.gray, 50), style=plot.style_circles, linewidth=1)
+
+// =====================================================
+// 🧠 INTRADAY INDICATORS
+// =====================================================
+vwap = ta.vwap
+ema9 = ta.ema(close, 9)
+ema20 = ta.ema(close, 20)
+
+volAvg = ta.sma(volume, 10)
+volSurge = volume > volAvg * 1.2
+
+plot(vwap, color=color.orange, title="VWAP", linewidth=2)
+plot(ema9, color=color.aqua, title="9 EMA")
+plot(ema20, color=color.purple, title="20 EMA")
+
+// =====================================================
+// 🚀 INTRADAY LOGIC ENGINE (LONG ONLY)
+// =====================================================
+longBullish = close > vwap and ema9 > ema20
+longPullback = low <= ema9 and close >= vwap
+longTrigger = longBullish and longPullback and close > open and close > close[1] and volSurge
+
+exitLong = ta.crossunder(close, ema9) and ema9 > vwap 
+
+// =====================================================
+// 🏆 VISUAL SIGNALS
+// =====================================================
+plotshape(longTrigger, title="BUY Entry", location=location.belowbar, style=shape.labelup, color=color.lime, text="BUY", textcolor=color.black, size=size.normal)
+plotshape(exitLong, title="Take Profit", location=location.abovebar, style=shape.labeldown, color=color.yellow, text="EXIT", textcolor=color.black, size=size.small)
+
+// =====================================================
+// 🔔 ALERTS
+// =====================================================
+alertcondition(longTrigger, title="Intraday BUY Alert", message="VWAP Bounce Detected - BUY!")
+alertcondition(exitLong, title="Intraday EXIT Alert", message="Momentum Fading - TAKE PROFITS!")

@@ -1,0 +1,200 @@
+//@version=5
+indicator("V6 Single Stock HUD (Fully Synced)", overlay=true)
+
+// ============================================================
+// INPUTS
+// ============================================================
+idx     = input.symbol("MYX:FBMKLCI", "Market Index (True RS)")
+trendTF = input.timeframe("D", "Trend Timeframe (anchor)")
+htfTF   = input.timeframe("W", "Higher Timeframe (weekly)")
+hudPos  = input.string("top_center", "HUD Position",
+          options=["top_left","top_center","top_right",
+                   "bottom_left","bottom_center","bottom_right"])
+
+// ============================================================
+// LAYER 1 — TREND anchored to Daily
+// FIX: always uses daily bars regardless of chart timeframe
+// so TREND shows PASS correctly on 1H, 4H, 5M charts
+// ============================================================
+f_ema(_len, _tf) =>
+    request.security(syminfo.tickerid, _tf, ta.ema(close, _len))
+
+d_close  = request.security(syminfo.tickerid, trendTF, close)
+d_ema50  = f_ema(50,  trendTF)
+d_ema150 = f_ema(150, trendTF)
+d_ema200 = f_ema(200, trendTF)
+
+dailyTrend = d_close > d_ema200 and d_ema50 > d_ema150 and d_ema150 > d_ema200
+
+w_close    = request.security(syminfo.tickerid, htfTF, close)
+w_ema200   = f_ema(200, htfTF)
+weeklyPass = w_close > w_ema200
+
+trendConfirm = dailyTrend and weeklyPass
+
+// ============================================================
+// LAYER 2 — TRUE RELATIVE STRENGTH vs FBMKLCI
+// ============================================================
+idxClose  = request.security(idx, timeframe.period, close)
+trueRS    = close / idxClose
+strongRS  = trueRS > ta.sma(trueRS, 50)
+
+// ============================================================
+// LAYER 3 — DAILY SQUEEZE (VCP base detection)
+// ============================================================
+d_atr    = request.security(syminfo.tickerid, trendTF, ta.atr(14))
+d_atrSma = request.security(syminfo.tickerid, trendTF, ta.sma(ta.atr(14), 20))
+d_vol    = request.security(syminfo.tickerid, trendTF, volume)
+d_volSma = request.security(syminfo.tickerid, trendTF, ta.sma(volume, 20))
+dailySqueeze = d_atr < d_atrSma and d_vol < d_volSma
+
+d_sqz1 = request.security(syminfo.tickerid, trendTF,
+         ta.atr(14)[1] < ta.sma(ta.atr(14), 20)[1])
+d_sqz2 = request.security(syminfo.tickerid, trendTF,
+         ta.atr(14)[2] < ta.sma(ta.atr(14), 20)[2])
+d_sqz3 = request.security(syminfo.tickerid, trendTF,
+         ta.atr(14)[3] < ta.sma(ta.atr(14), 20)[3])
+accum  = dailySqueeze or d_sqz1 or d_sqz2 or d_sqz3
+
+// ============================================================
+// LAYER 4 — DAILY BREAKOUT
+// ============================================================
+d_baseHigh = request.security(syminfo.tickerid, trendTF, ta.highest(high, 30)[1])
+d_volBreak = request.security(syminfo.tickerid, trendTF,
+             volume > ta.sma(volume, 20) * 1.5)
+breakout   = d_close > d_baseHigh and d_volBreak
+
+// ============================================================
+// LAYER 5 — INTRADAY LOCATION (current chart timeframe)
+// NEW: tells you WHERE price is right now on the chart
+// ============================================================
+vwap         = ta.vwap(high)
+aboveVwap    = close > vwap
+ema9         = ta.ema(close, 9)
+ema20        = ta.ema(close, 20)
+intradayBull = ema9 > ema20 and close > ema20
+nearEma20    = math.abs(close - ema20) / ema20 < 0.005
+pullback     = intradayBull and nearEma20
+
+// ============================================================
+// ACTION — using if/else (fixes Pine v5 line-continuation error)
+// ============================================================
+isExecute   = trendConfirm and strongRS and accum and breakout
+isSettingUp = trendConfirm and strongRS and dailySqueeze and not breakout
+isWatch     = trendConfirm and strongRS and not dailySqueeze
+isMonitor   = trendConfirm and not strongRS
+
+var string action = "IGNORE"
+if isExecute
+    action := "EXECUTE"
+else if isSettingUp
+    action := "SETTING UP"
+else if isWatch
+    action := "WATCH"
+else if isMonitor
+    action := "MONITOR"
+else
+    action := "IGNORE"
+
+var color actionCol = color.gray
+if isExecute
+    actionCol := color.new(color.blue, 0)
+else if isSettingUp
+    actionCol := color.new(color.lime, 0)
+else if isWatch
+    actionCol := color.new(color.yellow, 0)
+else if isMonitor
+    actionCol := color.new(color.orange, 0)
+else
+    actionCol := color.new(color.gray, 0)
+
+// ============================================================
+// LOCATION — using if/else (fixes Pine v5 line-continuation error)
+// ============================================================
+var string location = "BELOW VWAP"
+if aboveVwap and intradayBull and not pullback
+    location := "ABOVE VWAP"
+else if aboveVwap and pullback
+    location := "PULLBACK"
+else if aboveVwap and not intradayBull
+    location := "CHOPPING"
+else if not aboveVwap and intradayBull
+    location := "RECLAIMING"
+else
+    location := "BELOW VWAP"
+
+var color locationCol = color.red
+if location == "ABOVE VWAP"
+    locationCol := color.lime
+else if location == "PULLBACK"
+    locationCol := color.aqua
+else if location == "CHOPPING"
+    locationCol := color.yellow
+else if location == "RECLAIMING"
+    locationCol := color.orange
+else
+    locationCol := color.red
+
+// Squeeze label — single-line ternaries (2 conditions: OK in Pine v5)
+var string sqzText = "LOOSE"
+sqzText := isExecute ? "FIRING" : (dailySqueeze ? "TIGHT" : "LOOSE")
+
+var color sqzCol = color.red
+sqzCol := isExecute ? color.blue : (dailySqueeze ? color.lime : color.red)
+
+// ============================================================
+// HUD TABLE
+// NOTE: table.new() position must be a compile-time constant.
+// The position input is stored and used for future moves if
+// you rebuild the table, but initial creation uses top_center.
+// To change position, update the literal in table.new() below.
+// ============================================================
+var table hud = table.new(position.top_center, 6, 2,
+     border_width=1,
+     bgcolor=color.rgb(20, 20, 20, 10),
+     border_color=color.gray)
+
+var color hdr = color.rgb(30, 30, 80)
+
+if barstate.islast
+    table.cell(hud, 0, 0, "SYMBOL",   text_color=color.white, text_size=size.small, bgcolor=hdr)
+    table.cell(hud, 1, 0, "TREND",    text_color=color.white, text_size=size.small, bgcolor=hdr)
+    table.cell(hud, 2, 0, "TRUE RS",  text_color=color.white, text_size=size.small, bgcolor=hdr)
+    table.cell(hud, 3, 0, "SQUEEZE",  text_color=color.white, text_size=size.small, bgcolor=hdr)
+    table.cell(hud, 4, 0, "LOCATION", text_color=color.white, text_size=size.small, bgcolor=hdr)
+    table.cell(hud, 5, 0, "ACTION",   text_color=color.white, text_size=size.small, bgcolor=hdr)
+
+    table.cell(hud, 0, 1, syminfo.ticker,
+         text_color=color.white, text_size=size.small)
+    table.cell(hud, 1, 1, trendConfirm ? "PASS" : "FAIL",
+         text_color=trendConfirm ? color.lime : color.red, text_size=size.small)
+    table.cell(hud, 2, 1, strongRS ? "LEAD" : "LAG",
+         text_color=strongRS ? color.lime : color.red, text_size=size.small)
+    table.cell(hud, 3, 1, sqzText,   text_color=sqzCol,      text_size=size.small)
+    table.cell(hud, 4, 1, location,  text_color=locationCol, text_size=size.small)
+    table.cell(hud, 5, 1, action,    text_color=actionCol,   text_size=size.small)
+
+// ============================================================
+// VISUAL AIDS — EMA9, EMA20, VWAP plotted on chart
+// ============================================================
+plot(ema9,  "EMA 9",  color=color.new(color.red,    20), linewidth=1)
+plot(ema20, "EMA 20", color=color.new(color.orange,  20), linewidth=1)
+plot(vwap,  "VWAP",   color=color.new(color.aqua,    30), linewidth=1,
+     style=plot.style_circles)
+
+bgcolor(pullback and trendConfirm ? color.new(color.lime, 92) : na, title="Pullback zone")
+
+// ============================================================
+// ALERTS
+// ============================================================
+alertcondition(isExecute,
+     "HUD EXECUTE",
+     "{{ticker}} — EXECUTE: Breakout confirmed with trend + RS")
+
+alertcondition(isSettingUp,
+     "HUD SETTING UP",
+     "{{ticker}} — SETTING UP: Daily squeeze forming")
+
+alertcondition(pullback and trendConfirm and strongRS,
+     "HUD Pullback entry",
+     "{{ticker}} — Pullback to EMA20 in uptrend with strong RS")

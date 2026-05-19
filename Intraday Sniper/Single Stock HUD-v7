@@ -1,0 +1,399 @@
+//@version=5
+// ================================================================
+// V7 Single Stock HUD — KLSE Intraday Sniper
+//
+// Improvements vs V6:
+//  [v7-1]  VWAP source fixed: ta.vwap(hlc3) was ta.vwap(high),
+//          which biased VWAP upward ~0.3-0.8% on typical days
+//  [v7-2]  Table position input now WORKS — switch maps user
+//          selection to a Pine position constant at runtime
+//  [v7-3]  barstate.islast or barstate.isrealtime — HUD now
+//          updates tick-by-tick on the live bar, not just bar close
+//  [v7-4]  NA guard on True RS — prevents division crash when
+//          FBMKLCI data is unavailable on early history bars
+//  [v7-5]  RS momentum check — ratio must also be RISING;
+//          prevents entries on stocks rolling over while still
+//          technically above their SMA
+//  [v7-6]  Configurable squeeze lookback (was hardcoded 4 bars)
+//  [v7-7]  Expanded daily trend: 6 conditions — added MA200 rising
+//          (C3), 25% above 52wk low (C6), within 75% of 52wk
+//          high (C7). HUD shows score e.g. "5/6 D+W"
+//  [v7-8]  KLSE liquidity gate: min price RM 0.50, min 50-bar
+//          avg volume 200k — blocks penny stocks and thin books.
+//          Fail reason shown: PENNY / THIN / OK
+//  [v7-9]  ATR-based SL / TP1 / TP2 lines drawn on chart when
+//          ACTION is EXECUTE or ► SNIPE. Auto-reset on hit.
+//  [v7-10] Configurable pullback tolerance % — was hardcoded 0.5%
+//          which is too tight for KLSE wider spreads (default 1.0%)
+//  [v7-11] BB+KC (TTM Squeeze) mode — more reliable than ATR-only.
+//          Both computed as daily series via functions; toggled
+//          by a single input without duplicate request.security calls
+//  [v7-12] MCDX Smart Money proxy: RSI(50) + MFI(14) composite
+//          shown in SETUP column and context row
+//  [v7-13] OBV trend confirmation added to SETUP scoring
+//  [v7-14] Solid dark HUD cell backgrounds — readable on both
+//          light and dark chart themes (was near-transparent)
+//  [v7-15] SNIPE state — EXECUTE + LOCATION=PULLBACK = the ideal
+//          low-risk intraday entry: confirmed trend + at EMA20
+//  [v7-16] Bar coloring by action state (fuchsia=SNIPE, blue=EXECUTE,
+//          lime=SETTING UP, yellow=WATCH)
+//  [v7-17] SETUP column — combines VCP squeeze + MCDX + OBV
+//          into one grade: PRIMED / VCP+MCD / VCP+OBV / VCP / WEAK
+//  [v7-18] Signal deduplication in alerts — fires ONCE on the first
+//          bar of each new state, not every bar while state holds
+// ================================================================
+indicator("V7 Single Stock HUD — KLSE", overlay=true, max_lines_count=10)
+
+// ════════════════════════════════════════════════════════════════
+// 1. INPUTS
+// ════════════════════════════════════════════════════════════════
+grp_core  = "1. Core"
+idx       = input.symbol("MYX:FBMKLCI", "Market Index (RS)",          group=grp_core)
+trendTF   = input.timeframe("D",         "Trend Timeframe (anchor)",   group=grp_core)
+htfTF     = input.timeframe("W",         "Higher Timeframe (weekly)",  group=grp_core)
+
+grp_trend = "2. Trend"
+use_full_trend = input.bool(true, "[v7] 6-Condition Trend (vs 3-condition V6)", group=grp_trend)
+
+grp_rs    = "3. Relative Strength"
+rs_len    = input.int(50, "RS SMA Length",             minval=10,            group=grp_rs)
+rs_mom    = input.int(5,  "[v7] RS Momentum Lookback", minval=1,             group=grp_rs)
+
+grp_vcp   = "4. VCP / Squeeze"
+use_bb_sq = input.bool(true,  "[v7] BB+KC TTM Squeeze Mode",         group=grp_vcp)
+sqz_bars  = input.int(5,      "[v7] Squeeze Lookback (Bars)",  minval=1, maxval=20, group=grp_vcp)
+vol_mult  = input.float(1.5,  "Breakout Volume Multiplier",    step=0.1, group=grp_vcp)
+bo_bars   = input.int(30,     "Breakout High Lookback (Bars)", minval=5, maxval=100, group=grp_vcp)
+
+grp_klse  = "5. KLSE Filters"
+min_price = input.float(0.50,   "[v7] Min Price (RM)",           step=0.05,  group=grp_klse)
+min_vol   = input.int(200000,   "[v7] Min Avg Volume (shares)", step=50000, group=grp_klse)
+
+grp_intra = "6. Intraday"
+pb_pct    = input.float(1.0, "[v7] Pullback Tolerance %", step=0.1, minval=0.1, maxval=5.0, group=grp_intra) / 100
+
+grp_risk  = "7. Risk Management"
+show_sltp = input.bool(true,  "[v7] Show SL / TP1 / TP2 Lines", group=grp_risk)
+sl_mult   = input.float(1.5,  "[v7] Stop Loss ATR Multiplier",  step=0.1,  group=grp_risk)
+tp1_mult  = input.float(2.5,  "[v7] TP1 ATR Multiplier",        step=0.1,  group=grp_risk)
+tp2_mult  = input.float(4.0,  "[v7] TP2 ATR Multiplier",        step=0.1,  group=grp_risk)
+
+grp_disp  = "8. Display"
+hudPos    = input.string("Top Center", "[v7] HUD Position",
+  options=["Top Left","Top Center","Top Right","Bottom Left","Bottom Center","Bottom Right"],
+  group=grp_disp)
+show_bc   = input.bool(true, "[v7] Color Bars by Action State", group=grp_disp)
+
+// ════════════════════════════════════════════════════════════════
+// 2. DAILY TREND — 6-CONDITION  [v7-7]
+// ════════════════════════════════════════════════════════════════
+f_ema(_len) => ta.ema(close, _len)
+
+d_close        = request.security(syminfo.tickerid, trendTF, close,                   lookahead=barmerge.lookahead_off)
+d_ema50        = request.security(syminfo.tickerid, trendTF, f_ema(50),               lookahead=barmerge.lookahead_off)
+d_ema150       = request.security(syminfo.tickerid, trendTF, f_ema(150),              lookahead=barmerge.lookahead_off)
+d_ema200       = request.security(syminfo.tickerid, trendTF, f_ema(200),              lookahead=barmerge.lookahead_off)
+d_ema200_lag   = request.security(syminfo.tickerid, trendTF, ta.ema(close, 200)[20],  lookahead=barmerge.lookahead_off)
+d_high52       = request.security(syminfo.tickerid, trendTF, ta.highest(high, 245),   lookahead=barmerge.lookahead_off)
+d_low52        = request.security(syminfo.tickerid, trendTF, ta.lowest(low,   245),   lookahead=barmerge.lookahead_off)
+
+tc1 = not na(d_ema200)     and d_close  > d_ema200          // price above EMA200
+tc2 = not na(d_ema50)      and d_ema50  > d_ema150          // EMA50 above EMA150
+tc3 = not na(d_ema150)     and d_ema150 > d_ema200          // EMA150 above EMA200
+tc4 = not na(d_ema200_lag) and d_ema200 > d_ema200_lag      // [v7-7] EMA200 rising (C3)
+tc5 = not na(d_low52)      and d_close >= d_low52  * 1.25   // [v7-7] 25% above 52wk low (C6)
+tc6 = not na(d_high52)     and d_close >= d_high52 * 0.75   // [v7-7] within 75% of 52wk high (C7)
+
+trendScore = (tc1 ? 1 : 0) + (tc2 ? 1 : 0) + (tc3 ? 1 : 0) + (tc4 ? 1 : 0) + (tc5 ? 1 : 0) + (tc6 ? 1 : 0)
+dailyTrend = use_full_trend ? (tc1 and tc2 and tc3 and tc4 and tc5 and tc6) : (tc1 and tc2 and tc3)
+
+w_close      = request.security(syminfo.tickerid, htfTF, close,    lookahead=barmerge.lookahead_off)
+w_ema200     = request.security(syminfo.tickerid, htfTF, f_ema(200), lookahead=barmerge.lookahead_off)
+weeklyPass   = not na(w_ema200) and w_close > w_ema200
+trendConfirm = dailyTrend and weeklyPass
+
+// ════════════════════════════════════════════════════════════════
+// 3. TRUE RELATIVE STRENGTH  [v7-4] [v7-5]
+// ════════════════════════════════════════════════════════════════
+idxClose = request.security(idx, timeframe.period, close, lookahead=barmerge.lookahead_off)
+
+// [v7-4] NA guard — prevents division by zero/na on early history bars
+trueRS = not na(idxClose) and idxClose > 0 ? close / idxClose : na
+rsSma  = ta.sma(trueRS, rs_len)
+
+// [v7-5] Require ratio to be rising, not just above SMA
+rsAbove  = not na(trueRS) and not na(rsSma) and trueRS > rsSma
+rsRising = not na(trueRS) and not na(trueRS[rs_mom]) and trueRS > trueRS[rs_mom]
+strongRS = rsAbove and rsRising
+
+// ════════════════════════════════════════════════════════════════
+// 4. SQUEEZE  [v7-6] [v7-11]
+// ════════════════════════════════════════════════════════════════
+// Separate functions — avoids closure variable inside request.security
+f_atr_sqz() =>
+    _atr    = ta.atr(14)
+    _atrSma = ta.sma(_atr, 20)
+    _atr < _atrSma and volume < ta.sma(volume, 20)
+
+f_bbkc_sqz() =>
+    _atr    = ta.atr(14)
+    _atrSma = ta.sma(_atr, 20)
+    _bb     = ta.sma(close, 20)
+    _dev    = ta.stdev(close, 20)
+    _kc     = ta.ema(close, 20)
+    (_bb + _dev * 2.0) < (_kc + _atrSma * 1.5) and (_bb - _dev * 2.0) > (_kc - _atrSma * 1.5)
+
+d_atr_sqz  = request.security(syminfo.tickerid, trendTF, f_atr_sqz(),  lookahead=barmerge.lookahead_off)
+d_bbkc_sqz = request.security(syminfo.tickerid, trendTF, f_bbkc_sqz(), lookahead=barmerge.lookahead_off)
+d_sqz      = use_bb_sq ? d_bbkc_sqz : d_atr_sqz
+
+// [v7-6] Configurable lookback — any squeeze in the last N daily bars
+accum = false
+for i = 0 to sqz_bars - 1
+    if d_sqz[i]
+        accum := true
+
+// ════════════════════════════════════════════════════════════════
+// 5. DAILY BREAKOUT
+// ════════════════════════════════════════════════════════════════
+d_baseHigh = request.security(syminfo.tickerid, trendTF, ta.highest(high, bo_bars)[1], lookahead=barmerge.lookahead_off)
+d_volSma   = request.security(syminfo.tickerid, trendTF, ta.sma(volume, 20),           lookahead=barmerge.lookahead_off)
+d_vol      = request.security(syminfo.tickerid, trendTF, volume,                       lookahead=barmerge.lookahead_off)
+d_volBreak = d_vol > d_volSma * vol_mult
+breakout   = d_close > d_baseHigh and d_volBreak
+
+// ════════════════════════════════════════════════════════════════
+// 6. MCDX SMART MONEY + OBV  [v7-12] [v7-13]
+// ════════════════════════════════════════════════════════════════
+// RSI(50) + MFI(14) composite — proxy for institutional flow
+mcdx_rsi   = ta.rsi(close, 50)
+mcdx_mfi   = ta.mfi(hlc3, 14)
+banker_raw = ((mcdx_rsi - 50) * 3) + ((mcdx_mfi - 50) * 2)
+banker     = math.max(0, math.min(100, banker_raw))
+banker_smt = ta.ema(banker, 5)
+mcdxBull   = banker_smt >= 50
+
+// OBV trend — price rises without OBV confirmation = distribution risk
+obv_sma    = ta.sma(ta.obv, 20)
+obvRising  = ta.obv > obv_sma
+
+// ════════════════════════════════════════════════════════════════
+// 7. KLSE LIQUIDITY GATE  [v7-8]
+// ════════════════════════════════════════════════════════════════
+avg_vol_50  = ta.sma(volume, 50)
+price_ok    = close >= min_price
+vol_ok      = avg_vol_50 >= min_vol
+liquidityOk = price_ok and vol_ok
+
+// ════════════════════════════════════════════════════════════════
+// 8. INTRADAY LOCATION  [v7-1] [v7-10]
+// ════════════════════════════════════════════════════════════════
+// [v7-1] Fixed: hlc3 is the correct VWAP anchor (typical price)
+vwap         = ta.vwap(hlc3)
+aboveVwap    = close > vwap
+ema9         = ta.ema(close, 9)
+ema20        = ta.ema(close, 20)
+intradayBull = ema9 > ema20 and close > ema20
+// [v7-10] User-configurable pullback window (default 1.0%, was 0.5%)
+nearEma20    = math.abs(close - ema20) / ema20 < pb_pct
+pullback     = intradayBull and nearEma20 and aboveVwap
+
+var string locStr = "BELOW VWAP"
+var color  locCol = color.red
+if aboveVwap and intradayBull and not pullback
+    locStr := "ABOVE VWAP"
+    locCol := color.lime
+else if aboveVwap and pullback
+    locStr := "PULLBACK"
+    locCol := color.aqua
+else if aboveVwap and not intradayBull
+    locStr := "CHOPPING"
+    locCol := color.yellow
+else if not aboveVwap and intradayBull
+    locStr := "RECLAIMING"
+    locCol := color.orange
+else
+    locStr := "BELOW VWAP"
+    locCol := color.red
+
+// ════════════════════════════════════════════════════════════════
+// 9. ACTION LOGIC  [v7-15]
+// ════════════════════════════════════════════════════════════════
+// SNIPE = the highest-conviction entry: all conditions + EMA20 pullback
+isSnipe     = trendConfirm and strongRS and accum and breakout and pullback and liquidityOk
+isExecute   = trendConfirm and strongRS and accum and breakout and liquidityOk and not pullback
+isSettingUp = trendConfirm and strongRS and accum and not breakout
+isWatch     = trendConfirm and strongRS and not accum
+isMonitor   = trendConfirm and not strongRS
+
+var string actStr = "IGNORE"
+if isSnipe
+    actStr := "► SNIPE"
+else if isExecute
+    actStr := "EXECUTE"
+else if isSettingUp
+    actStr := "SETTING UP"
+else if isWatch
+    actStr := "WATCH"
+else if isMonitor
+    actStr := "MONITOR"
+else
+    actStr := "IGNORE"
+
+// ════════════════════════════════════════════════════════════════
+// 10. SETUP GRADE — VCP + MCDX + OBV  [v7-17]
+// ════════════════════════════════════════════════════════════════
+smartConf = mcdxBull and obvRising
+
+var string setupStr = "WEAK"
+if accum and smartConf
+    setupStr := "PRIMED"
+else if accum and mcdxBull
+    setupStr := "VCP+MCD"
+else if accum and obvRising
+    setupStr := "VCP+OBV"
+else if accum
+    setupStr := "VCP"
+else if smartConf
+    setupStr := "MCDX+OBV"
+else
+    setupStr := "WEAK"
+
+// ════════════════════════════════════════════════════════════════
+// 11. SL / TP LINES  [v7-9]
+// ════════════════════════════════════════════════════════════════
+atr14      = ta.atr(14)
+actionOn   = isSnipe or isExecute
+
+var float sl_line  = na
+var float tp1_line = na
+var float tp2_line = na
+
+// Set levels on the FIRST bar of a new EXECUTE / SNIPE state
+if actionOn and not actionOn[1]
+    sl_line  := close - atr14 * sl_mult
+    tp1_line := close + atr14 * tp1_mult
+    tp2_line := close + atr14 * tp2_mult
+
+// Auto-reset when price hits stop or TP1
+if not actionOn
+    if not na(sl_line) and low <= sl_line
+        sl_line  := na
+        tp1_line := na
+        tp2_line := na
+    else if not na(tp1_line) and high >= tp1_line
+        tp1_line := na
+
+plot(show_sltp ? sl_line  : na, "Stop Loss", color=color.new(color.red,  20), linewidth=1, style=plot.style_linebr)
+plot(show_sltp ? tp1_line : na, "TP1",       color=color.new(color.lime, 20), linewidth=2, style=plot.style_linebr)
+plot(show_sltp ? tp2_line : na, "TP2",       color=color.new(color.teal, 20), linewidth=1, style=plot.style_linebr)
+
+// ════════════════════════════════════════════════════════════════
+// 12. CHART VISUALS  [v7-16]
+// ════════════════════════════════════════════════════════════════
+plot(ema9,  "EMA 9",  color=color.new(color.red,    20), linewidth=1)
+plot(ema20, "EMA 20", color=color.new(color.orange, 20), linewidth=1)
+plot(vwap,  "VWAP",   color=color.new(color.aqua,   30), linewidth=1, style=plot.style_circles)
+
+bgcolor(pullback and trendConfirm ? color.new(color.lime, 92) : na, title="Pullback Zone")
+
+// [v7-16] Bar coloring — pre-assigned to avoid multi-line ternary issues
+var color bc = na
+if show_bc
+    if isSnipe
+        bc := color.new(color.fuchsia, 50)
+    else if isExecute
+        bc := color.new(color.blue, 50)
+    else if isSettingUp
+        bc := color.new(color.lime, 65)
+    else if isWatch
+        bc := color.new(color.yellow, 65)
+    else
+        bc := na
+else
+    bc := na
+barcolor(bc, title="Action Bar Color")
+
+// ════════════════════════════════════════════════════════════════
+// 13. HUD TABLE  [v7-2] [v7-3] [v7-14]
+// ════════════════════════════════════════════════════════════════
+// [v7-2] Position input now works — switch maps string to constant
+hudPosition = switch hudPos
+    "Top Left"      => position.top_left
+    "Top Center"    => position.top_center
+    "Top Right"     => position.top_right
+    "Bottom Left"   => position.bottom_left
+    "Bottom Center" => position.bottom_center
+    "Bottom Right"  => position.bottom_right
+    =>                 position.top_center
+
+// [v7-14] Solid dark cell backgrounds — readable on light AND dark themes
+c_hdr   = color.rgb(20,  20, 70)
+c_lbl   = color.rgb(15,  15, 35)
+c_good  = color.rgb(10,  55, 10)
+c_bad   = color.rgb(65,  10, 10)
+c_warn  = color.rgb(65,  48,  0)
+c_neu   = color.rgb(25,  25, 40)
+c_snipe = color.rgb(75,   0, 75)
+c_exec  = color.rgb(0,    0, 85)
+
+// 7 columns × 3 rows: header + main data + context numbers
+var table hud = table.new(hudPosition, 7, 3, border_width=1, bgcolor=color.rgb(15, 15, 25), border_color=color.rgb(50, 50, 70))
+
+// [v7-3] barstate.isrealtime → live tick updates during open bar
+if barstate.islast or barstate.isrealtime
+    // ── Row 0: Headers ──────────────────────────────────────────
+    table.cell(hud, 0, 0, "SYMBOL",   text_color=color.white, text_size=size.small, bgcolor=c_hdr)
+    table.cell(hud, 1, 0, "TREND",    text_color=color.white, text_size=size.small, bgcolor=c_hdr)
+    table.cell(hud, 2, 0, "TRUE RS",  text_color=color.white, text_size=size.small, bgcolor=c_hdr)
+    table.cell(hud, 3, 0, "SETUP",    text_color=color.white, text_size=size.small, bgcolor=c_hdr)
+    table.cell(hud, 4, 0, "LOCATION", text_color=color.white, text_size=size.small, bgcolor=c_hdr)
+    table.cell(hud, 5, 0, "KLSE",     text_color=color.white, text_size=size.small, bgcolor=c_hdr)
+    table.cell(hud, 6, 0, "ACTION",   text_color=color.white, text_size=size.small, bgcolor=c_hdr)
+
+    // ── Row 1: Main status ───────────────────────────────────────
+    trendBg  = trendConfirm ? c_good : dailyTrend ? c_warn : c_bad
+    trendTxt = str.tostring(trendScore) + "/6" + (weeklyPass ? " D+W" : " D")
+    rsBg     = strongRS ? c_good : rsAbove ? c_warn : c_bad
+    rsTxt    = strongRS ? "LEAD +" : rsAbove ? "LEAD" : "LAGGING"
+    setupBg  = setupStr == "PRIMED" ? c_good : setupStr == "WEAK" ? c_bad : c_warn
+    liqBg    = liquidityOk ? c_good : not price_ok ? c_bad : c_warn
+    liqTxt   = liquidityOk ? "OK" : not price_ok ? "PENNY" : "THIN"
+    actBg    = isSnipe ? c_snipe : isExecute ? c_exec : isSettingUp ? c_good : isWatch ? c_warn : c_neu
+
+    table.cell(hud, 0, 1, syminfo.ticker, text_color=color.white, text_size=size.small, bgcolor=c_lbl)
+    table.cell(hud, 1, 1, trendTxt,       text_color=color.white, text_size=size.small, bgcolor=trendBg)
+    table.cell(hud, 2, 1, rsTxt,          text_color=color.white, text_size=size.small, bgcolor=rsBg)
+    table.cell(hud, 3, 1, setupStr,       text_color=color.white, text_size=size.small, bgcolor=setupBg)
+    table.cell(hud, 4, 1, locStr,         text_color=color.white, text_size=size.small, bgcolor=c_neu)
+    table.cell(hud, 5, 1, liqTxt,         text_color=color.white, text_size=size.small, bgcolor=liqBg)
+    table.cell(hud, 6, 1, actStr,         text_color=color.white, text_size=size.small, bgcolor=actBg)
+
+    // ── Row 2: Context numbers (small print) ─────────────────────
+    slTxt   = not na(sl_line) ? "SL " + str.tostring(math.round(sl_line, 3)) : "No SL"
+    volKTxt = str.tostring(math.round(avg_vol_50 / 1000, 0)) + "k avg"
+    mcdxTxt = str.tostring(math.round(banker_smt, 0)) + "% " + (mcdxBull ? "MCD+" : "MCD-")
+    obvTxt  = obvRising ? "OBV +" : "OBV -"
+    vwapTxt = "VWAP " + str.tostring(math.round(vwap, 3))
+
+    table.cell(hud, 0, 2, "RM " + str.tostring(math.round(close, 3)), text_color=color.rgb(170, 170, 190), text_size=size.tiny, bgcolor=c_lbl)
+    table.cell(hud, 1, 2, use_full_trend ? "6-cond" : "3-cond",       text_color=color.rgb(170, 170, 190), text_size=size.tiny, bgcolor=c_lbl)
+    table.cell(hud, 2, 2, mcdxTxt,                                     text_color=color.rgb(170, 170, 190), text_size=size.tiny, bgcolor=c_lbl)
+    table.cell(hud, 3, 2, obvTxt,                                       text_color=color.rgb(170, 170, 190), text_size=size.tiny, bgcolor=c_lbl)
+    table.cell(hud, 4, 2, vwapTxt,                                      text_color=color.rgb(170, 170, 190), text_size=size.tiny, bgcolor=c_lbl)
+    table.cell(hud, 5, 2, volKTxt,                                      text_color=color.rgb(170, 170, 190), text_size=size.tiny, bgcolor=c_lbl)
+    table.cell(hud, 6, 2, slTxt,                                        text_color=color.rgb(170, 170, 190), text_size=size.tiny, bgcolor=c_lbl)
+
+// ════════════════════════════════════════════════════════════════
+// 14. ALERTS  [v7-18]
+// ════════════════════════════════════════════════════════════════
+// [v7-18] Deduplicated — fires once on FIRST bar of each new state
+new_snipe   = isSnipe     and not isSnipe[1]
+new_execute = isExecute   and not isExecute[1]
+new_setup   = isSettingUp and not isSettingUp[1]
+new_pull    = pullback and trendConfirm and strongRS and not (pullback[1] and trendConfirm[1] and strongRS[1])
+
+alertcondition(new_snipe,   "HUD ► SNIPE",   "{{ticker}} — ► SNIPE: Breakout + EMA20 pullback in confirmed uptrend — lowest-risk intraday entry")
+alertcondition(new_execute, "HUD EXECUTE",    "{{ticker}} — EXECUTE: Breakout confirmed with trend + RS + liquidity")
+alertcondition(new_setup,   "HUD SETTING UP", "{{ticker}} — SETTING UP: VCP squeeze forming — watch for breakout")
+alertcondition(new_pull,    "HUD Pullback",   "{{ticker}} — Pullback to EMA20 zone — sniper entry window open")

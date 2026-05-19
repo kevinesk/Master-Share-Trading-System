@@ -1,0 +1,306 @@
+//@version=5
+// ================================================================
+// V7 Pro Quant Desk (KLSE) + True RS + Heat
+// KLSE / Bursa Malaysia Edition
+//
+// Improvements vs V6:
+//  [v7-1]  EMA calculations anchored to Daily TF via request.security
+//          → Fixes completely wrong EMA values when chart is on 4H/1H
+//  [v7-2]  Replaced nz() with proper na() guards
+//          → nz(ema200) defaults to 0, making close > 0 always true
+//  [v7-3]  RS now requires momentum confirmation (ratio must be rising)
+//  [v7-4]  Squeeze: added BB+KC (TTM Squeeze) mode alongside ATR-only
+//  [v7-5]  Accumulation window configurable (was hardcoded 4 bars)
+//  [v7-6]  Signal deduplication — only FIRST bar of a signal sequence
+//          counted; fixes inflated trade count and fake 100% win rate
+//  [v7-7]  Win rate uses N-bar forward return (not same-bar momentum)
+//  [v7-8]  Peak equity explicitly initialized to 10,000
+//  [v7-9]  SL / TP1 / TP2 horizontal lines drawn on chart (ATR-based)
+//          with auto-reset when price hits the level
+//  [v7-10] BUY label plotted on chart when execute fires
+//  [v7-11] Strike zone visualized as yellow bgcolor + diamond shape
+//  [v7-12] Bar coloring by trend state (teal = full, blue = daily only)
+//  [v7-13] Dashboard: solid dark cell backgrounds — readable on any
+//          chart theme (light or dark)
+//  [v7-14] Dashboard: barstate.islast or barstate.isrealtime fix
+//  [v7-15] Expectancy and drawdown shown in dashboard
+//  [v7-16] All key parameters made user-configurable
+// ================================================================
+indicator("V7 Pro Quant Desk (KLSE) + True RS + Heat", overlay=true, max_labels_count=200, max_lines_count=10)
+
+// ================================================================
+// 1. INPUTS
+// ================================================================
+grp_core = "1. Core Settings"
+idx       = input.symbol("MYX:FBMKLCI", "Market Index (FBM KLCI)", group=grp_core)
+// [v7-1] All EMA/trend calculations run on this timeframe regardless of chart TF.
+// Set to "D" (Daily) for standard Minervini-style analysis.
+// Running this script on a 4H chart without this fix gives wrong EMAs.
+anchor_tf = input.timeframe("D", "[v7] EMA Anchor Timeframe", group=grp_core)
+
+grp_vcp = "2. VCP & Breakout"
+base_lookback  = input.int(30,    "Base High Lookback (Bars)",          minval=10, maxval=100, group=grp_vcp)
+accum_window   = input.int(10,    "[v7] Accumulation Window (Bars)",    minval=2,  maxval=30,  group=grp_vcp)
+vol_mult_bo    = input.float(1.5, "Breakout Volume Multiplier",         step=0.1,              group=grp_vcp)
+use_bb_squeeze = input.bool(true, "[v7] BB+KC Squeeze (TTM Mode)",                            group=grp_vcp)
+
+grp_rs = "3. Relative Strength"
+rs_len      = input.int(50, "RS Trend SMA Length",              minval=10, group=grp_rs)
+rs_mom_bars = input.int(5,  "[v7] RS Momentum Lookback (Bars)", minval=1,  group=grp_rs)
+
+grp_risk = "4. Risk Management"
+swing_limit  = input.float(35.0, "Max Swing Exposure %",              minval=5, maxval=100, step=5,  group=grp_risk) / 100
+win_rr       = input.float(20.0, "Win Return % (R-multiple)",         step=1.0,                      group=grp_risk) / 100
+loss_rr      = input.float(8.0,  "Loss Risk %  (R-multiple)",         step=1.0,                      group=grp_risk) / 100
+fwd_bars     = input.int(5,      "[v7] Forward Return Check (Bars)",  minval=1, maxval=20,            group=grp_risk)
+atr_sl_mult  = input.float(2.0,  "[v7] Stop Loss ATR Multiplier",     step=0.1,                      group=grp_risk)
+atr_tp1_mult = input.float(3.0,  "[v7] TP1 ATR Multiplier",           step=0.1,                      group=grp_risk)
+atr_tp2_mult = input.float(5.0,  "[v7] TP2 ATR Multiplier",           step=0.1,                      group=grp_risk)
+
+grp_disp = "5. Display"
+show_sl_tp    = input.bool(true,  "[v7] Show SL / TP Lines on Chart",      group=grp_disp)
+show_strike   = input.bool(true,  "[v7] Show Strike Zone Highlight",        group=grp_disp)
+show_barcolor = input.bool(true,  "[v7] Color Bars by Trend State",         group=grp_disp)
+// ── Dashboard row toggles — disable any row to slim the table ──
+show_squeeze_row = input.bool(true,  "Dashboard: VCP Squeeze Row",          group=grp_disp)
+show_volbrk_row  = input.bool(false, "Dashboard: Vol Breakout Row",         group=grp_disp)
+show_strike_row  = input.bool(true,  "Dashboard: Strike Zone Row",          group=grp_disp)
+show_risk_row    = input.bool(true,  "Dashboard: Risk / Exposure Row",      group=grp_disp)
+
+// ================================================================
+// 2. MULTI-TIMEFRAME TREND CONFIRMATION  [v7-1] [v7-2]
+// ================================================================
+// [v7-1] Pull EMAs from anchor_tf (default Daily) so the values are
+// correct regardless of the chart timeframe (4H, 1H, Weekly etc.)
+ema50_d  = request.security(syminfo.tickerid, anchor_tf, ta.ema(close, 50),  lookahead=barmerge.lookahead_off)
+ema150_d = request.security(syminfo.tickerid, anchor_tf, ta.ema(close, 150), lookahead=barmerge.lookahead_off)
+ema200_d = request.security(syminfo.tickerid, anchor_tf, ta.ema(close, 200), lookahead=barmerge.lookahead_off)
+
+// [v7-2] Proper NA guards. The original used nz(ema200) which defaults
+// to 0 on early bars, making close > 0 always true = false trend signal.
+trend = not na(ema50_d) and not na(ema150_d) and not na(ema200_d) and close > ema200_d and ema50_d > ema150_d and ema150_d > ema200_d
+
+// Higher-timeframe confirmation: Weekly close must be above Weekly EMA200
+htfTrend = request.security(syminfo.tickerid, "W", not na(ta.ema(close, 200)) and close > ta.ema(close, 200), lookahead=barmerge.lookahead_off)
+trendConfirm = trend and htfTrend
+
+// ================================================================
+// 3. TRUE RELATIVE STRENGTH ENGINE  [v7-3]
+// ================================================================
+idxClose = request.security(idx, timeframe.period, close, lookahead=barmerge.lookahead_off)
+
+// Guard against division by zero or missing data
+trueRS    = not na(idxClose) and idxClose > 0 ? close / idxClose : na
+rsTrend   = ta.sma(trueRS, rs_len)
+rsLeading = not na(trueRS) and not na(rsTrend) and trueRS > rsTrend
+
+// [v7-3] RS momentum: the ratio itself must be rising over rs_mom_bars
+// Prevents entering when stock is "above average" but actually rolling over
+rsMomentum = not na(trueRS) and not na(trueRS[rs_mom_bars]) and trueRS > trueRS[rs_mom_bars]
+rsConfirm  = rsLeading and rsMomentum
+
+// ================================================================
+// 4. VCP EDGE & VOLUME  [v7-4] [v7-5]
+// ================================================================
+volAvg  = ta.sma(volume, 20)
+atr14   = ta.atr(14)
+atr_ma  = ta.sma(atr14, 20)
+
+// [v7-4] BB+KC Squeeze (John Carter / TTM Squeeze method)
+// Fires when Bollinger Bands narrow inside the Keltner Channel —
+// a more reliable measure of true volatility contraction than ATR alone.
+bb_basis  = ta.sma(close, 20)
+bb_dev    = ta.stdev(close, 20)
+bb_upper  = bb_basis + bb_dev * 2.0
+bb_lower  = bb_basis - bb_dev * 2.0
+kc_basis  = ta.ema(close, 20)
+kc_upper  = kc_basis + atr_ma * 1.5
+kc_lower  = kc_basis - atr_ma * 1.5
+bb_kc_sq  = bb_upper < kc_upper and bb_lower > kc_lower  // BB inside KC = squeeze
+
+atr_sq_bar   = atr14 < atr_ma and volume < volAvg
+squeeze_bar  = use_bb_squeeze ? bb_kc_sq : atr_sq_bar
+
+// [v7-5] Configurable accumulation window (was hardcoded at only 4 bars,
+// which is 16 hours on a 4H chart — far too short to confirm real coiling)
+accum = false
+for i = 1 to accum_window
+    if squeeze_bar[i]
+        accum := true
+
+baseHigh = ta.highest(high, base_lookback)
+breakout = close > baseHigh[1]
+volBreak = volume > volAvg * vol_mult_bo
+
+// ================================================================
+// 5. A+ SIGNAL & DEDUPLICATION  [v7-6]
+// ================================================================
+signal = trendConfirm and rsConfirm and accum and breakout and volBreak
+
+// [v7-6] Only count the FIRST bar of each new signal sequence.
+// In V6, if signal stayed true for 5 bars it was logged as 5 trades,
+// inflating trade count and producing a fake 100% win rate.
+new_signal = signal and not signal[1]
+
+// ================================================================
+// 6. TRADE JOURNAL & METRICS  [v7-7] [v7-8]
+// ================================================================
+var float trades = 0.0
+var float wins   = 0.0
+var float losses = 0.0
+
+// [v7-7] Forward return: look back fwd_bars and check if price rose
+// since then. Far more meaningful than same-bar close > close[1].
+// e.g. fwd_bars=5: "Did price rise 5 bars after the signal fired?"
+if new_signal[fwd_bars]
+    trades += 1
+    if close > close[fwd_bars]
+        wins   += 1
+    else
+        losses += 1
+
+winRate    = trades > 0 ? (wins / trades) * 100 : 0
+expectancy = (winRate / 100 * win_rr) - ((1.0 - winRate / 100) * loss_rr)
+
+// [v7-8] Explicit initialization of both equity and peak to 10,000
+var float equity = 10000.0
+var float peak   = 10000.0
+
+if new_signal[fwd_bars]
+    won     = close > close[fwd_bars]
+    equity := equity + (won ? equity * win_rr : -(equity * loss_rr))
+
+peak     := math.max(peak, equity)
+drawdown  = peak > 0 ? (equity - peak) / peak : 0.0
+riskOff   = drawdown < -0.10 or expectancy < 0
+
+// ================================================================
+// 7. PORTFOLIO HEAT & EXECUTION GATE
+// ================================================================
+maxExposure = riskOff ? swing_limit / 2.0 : swing_limit
+execute     = new_signal and not riskOff
+
+// ================================================================
+// 8. SL / TP LEVELS  [v7-9]
+// Persistent horizontal lines that auto-reset when price hits them
+// ================================================================
+var float active_sl  = na
+var float active_tp1 = na
+var float active_tp2 = na
+
+// Set new levels when a trade is executed
+if execute
+    active_sl  := close - atr14 * atr_sl_mult
+    active_tp1 := close + atr14 * atr_tp1_mult
+    active_tp2 := close + atr14 * atr_tp2_mult
+
+// Auto-reset when price hits stop or TP1 (position closed / partial)
+if not execute
+    if not na(active_sl) and low <= active_sl
+        active_sl  := na
+        active_tp1 := na
+        active_tp2 := na
+    else if not na(active_tp1) and high >= active_tp1
+        active_tp1 := na  // TP1 hit — runner continues to TP2
+
+plot(show_sl_tp ? active_sl  : na, "Stop Loss", color=color.new(color.red,   20), linewidth=1, style=plot.style_linebr)
+plot(show_sl_tp ? active_tp1 : na, "TP1",       color=color.new(color.lime,  20), linewidth=2, style=plot.style_linebr)
+plot(show_sl_tp ? active_tp2 : na, "TP2",       color=color.new(color.teal,  20), linewidth=1, style=plot.style_linebr)
+
+// ================================================================
+// 9. CHART VISUALS  [v7-10] [v7-11] [v7-12]
+// ================================================================
+
+// [v7-10] BUY label on the chart when execute fires
+// V6 had no entry label — impossible to see when signal triggered
+plotshape(execute, "EXECUTE Signal", shape.labelup, location.belowbar, color=color.new(color.lime, 0), text="BUY", textcolor=color.black, size=size.normal)
+
+// [v7-11] Strike Zone: optimal pullback entry zone
+// Price within 3% above EMA20 while in confirmed uptrend
+ema20      = ta.ema(close, 20)
+strikeZone = close >= ema20 and close <= ema20 * 1.03 and trendConfirm
+
+plotshape(show_strike and strikeZone, "Strike Zone", shape.diamond, location.belowbar, color=color.new(color.yellow, 10), size=size.tiny)
+bgcolor(show_strike and strikeZone ? color.new(color.yellow, 90) : na, title="Strike Zone Background")
+
+alertcondition(strikeZone, title="Strike Zone Pullback", message="V7 Pro Quant: {{ticker}} in the 3% EMA20 sniper zone — ready your entry!")
+
+// [v7-12] Bar coloring by trend state
+// Teal  = full alignment (Daily + Weekly)
+// Blue  = Daily trend only (Weekly not confirmed yet)
+// No color = trend not confirmed
+barcolor(show_barcolor and trendConfirm ? color.new(color.teal, 55) : show_barcolor and trend ? color.new(color.blue, 55) : na, title="Trend Bar Color")
+
+// ================================================================
+// 10. DASHBOARD  [v7-13] [v7-14] [v7-15]
+// ================================================================
+// [v7-13] Solid dark backgrounds — eliminates the white-text-on-white
+//         background problem that made V6 unreadable on light themes
+c_hdr  = color.rgb(20,  20, 70)    // deep navy header
+c_lbl  = color.rgb(20,  20, 38)    // dark label column
+c_good = color.rgb(10,  58, 10)    // dark green (pass)
+c_bad  = color.rgb(68,  10, 10)    // dark red (fail)
+c_warn = color.rgb(68,  48,  0)    // dark amber (caution)
+c_neu  = color.rgb(28,  28, 42)    // neutral dark slate
+c_txt  = color.white
+c_sub  = color.rgb(155, 165, 185)  // silver-blue label text
+
+// ── Dynamic row-index wiring ─────────────────────────────────────────────────
+// Always shown: header(0), Trend D+W(1), RS vs KLCI(2), ► EXECUTE(last)
+// Each enabled optional row shifts all rows below it up by 1
+r7_trend   = 1
+r7_rs      = 2
+r7_squeeze = 3
+r7_volbrk  = r7_squeeze + (show_squeeze_row ? 1 : 0)
+r7_strike  = r7_volbrk  + (show_volbrk_row  ? 1 : 0)
+r7_risk    = r7_strike  + (show_strike_row   ? 1 : 0)
+r7_signal  = r7_risk    + (show_risk_row     ? 1 : 0)
+v7_rows    = r7_signal  + 1
+
+var table t = table.new(position.bottom_right, 2, v7_rows, border_width=1, bgcolor=color.rgb(12, 12, 22), border_color=color.rgb(55, 55, 75))
+
+// [v7-14] barstate.isrealtime ensures table updates on live (unconfirmed) bar
+if barstate.islast or barstate.isrealtime
+    // ── Header ──────────────────────────────────────────────────────────────
+    table.cell(t, 0, 0, "V7 PRO DESK", text_color=c_txt, bgcolor=c_hdr, text_size=size.small)
+    table.cell(t, 1, 0, "KLSE",        text_color=c_txt, bgcolor=c_hdr, text_size=size.small)
+
+    // ── IS IT IN A CONFIRMED UPTREND? (always shown) ────────────────────────
+    table.cell(t, 0, r7_trend, "Trend D+W", text_color=c_sub, bgcolor=c_lbl, text_size=size.small)
+    table.cell(t, 1, r7_trend, trendConfirm ? "ALIGNED" : trend ? "DAY ONLY" : "NO TREND", text_color=c_txt, bgcolor=trendConfirm ? c_good : trend ? c_warn : c_bad, text_size=size.small)
+
+    // ── IS IT OUTPERFORMING THE KLCI? (always shown) ────────────────────────
+    table.cell(t, 0, r7_rs, "RS vs KLCI", text_color=c_sub, bgcolor=c_lbl, text_size=size.small)
+    table.cell(t, 1, r7_rs, rsConfirm ? "LEAD +" : rsLeading ? "LEAD" : "LAGGING", text_color=c_txt, bgcolor=rsConfirm ? c_good : rsLeading ? c_warn : c_bad, text_size=size.small)
+
+    // ── IS PRICE COILING FOR A BREAKOUT? (optional) ─────────────────────────
+    if show_squeeze_row
+        table.cell(t, 0, r7_squeeze, "VCP Squeeze", text_color=c_sub, bgcolor=c_lbl, text_size=size.small)
+        table.cell(t, 1, r7_squeeze, accum ? "YES" : "NO", text_color=c_txt, bgcolor=accum ? c_good : c_neu, text_size=size.small)
+
+    // ── IS VOLUME CONFIRMING THE MOVE? (optional) ───────────────────────────
+    if show_volbrk_row
+        table.cell(t, 0, r7_volbrk, "Vol Breakout", text_color=c_sub, bgcolor=c_lbl, text_size=size.small)
+        table.cell(t, 1, r7_volbrk, volBreak ? "YES" : "NO", text_color=c_txt, bgcolor=volBreak ? c_good : c_neu, text_size=size.small)
+
+    // ── IS PRICE IN THE OPTIMAL EMA20 PULLBACK ZONE? (optional) ────────────
+    if show_strike_row
+        table.cell(t, 0, r7_strike, "Strike Zone", text_color=c_sub, bgcolor=c_lbl, text_size=size.small)
+        table.cell(t, 1, r7_strike, strikeZone ? "IN ZONE" : "—", text_color=c_txt, bgcolor=strikeZone ? c_warn : c_neu, text_size=size.small)
+
+    // ── HOW MUCH CAPITAL TO DEPLOY? (optional) ──────────────────────────────
+    if show_risk_row
+        risk_str = (riskOff ? "DEFENSE" : "NORMAL") + "  " + str.tostring(math.round(maxExposure * 100, 0)) + "%"
+        table.cell(t, 0, r7_risk, "Risk | Exposure", text_color=c_sub, bgcolor=c_lbl, text_size=size.small)
+        table.cell(t, 1, r7_risk, risk_str, text_color=c_txt, bgcolor=riskOff ? c_bad : c_neu, text_size=size.small)
+
+    // ── BUY NOW? (always shown — the final decision row) ────────────────────
+    exec_bg  = execute ? c_good : signal ? c_warn : c_neu
+    exec_txt = execute ? "► BUY NOW" : signal ? "SETUP OK" : "WAIT"
+    table.cell(t, 0, r7_signal, "► EXECUTE", text_color=c_sub, bgcolor=c_lbl, text_size=size.small)
+    table.cell(t, 1, r7_signal, exec_txt, text_color=c_txt, bgcolor=exec_bg, text_size=size.small)
+
+// ================================================================
+// 11. ALERTS
+// ================================================================
+alertcondition(execute, title="V7 A+ Execute Signal", message="V7 Pro Quant KLSE: EXECUTE on {{ticker}} | Price: {{close}}")

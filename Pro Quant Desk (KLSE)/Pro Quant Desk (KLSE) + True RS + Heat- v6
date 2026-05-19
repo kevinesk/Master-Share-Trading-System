@@ -1,0 +1,108 @@
+//@version=5
+indicator("V6 Pro Quant Desk (KLSE) + True RS + Heat", overlay=true)
+
+// =====================================================
+// 📋 INPUTS
+// =====================================================
+idx = input.symbol("MYX:FBMKLCI", "Market Index (For True RS)")
+
+// =====================================================
+// 🧠 MULTI-TIMEFRAME TREND CONFIRMATION
+// =====================================================
+ema50 = ta.ema(close, 50)
+ema150 = ta.ema(close, 150)
+ema200 = ta.ema(close, 200)
+
+trend = close > nz(ema200) and ema50 > nz(ema150) and ema150 > nz(ema200)
+htfTrend = request.security(syminfo.tickerid, "W", close > nz(ta.ema(close, 200)))
+trendConfirm = trend and htfTrend
+
+// =====================================================
+// 🥇 TRUE RELATIVE STRENGTH ENGINE
+// =====================================================
+// Compares stock close directly to the KLSE Index
+idxClose = request.security(idx, timeframe.period, close)
+trueRS = close / idxClose
+rsTrend50 = ta.sma(trueRS, 50)
+rsLeading = trueRS > rsTrend50 // Stock is outperforming the broader market
+
+// =====================================================
+// 🚀 VCP EDGE & VOLUME
+// =====================================================
+volAvg = ta.sma(volume, 20)
+atr = ta.atr(14)
+
+squeeze = atr < ta.sma(atr, 20) and volume < volAvg
+accum = squeeze[1] or squeeze[2] or squeeze[3] or squeeze[4] 
+
+baseHigh = ta.highest(high, 30)
+breakout = close > baseHigh[1]
+volBreak = volume > volAvg * 1.5
+
+// =====================================================
+// 🏆 FINAL A+ SIGNAL (Now requires True RS Leadership)
+// =====================================================
+signal = trendConfirm and rsLeading and accum and breakout and volBreak
+
+// =====================================================
+// 📒 TRADE JOURNAL & METRICS
+// =====================================================
+var float trades = 0, var float wins = 0, var float losses = 0
+if signal
+    trades += 1
+    win = close > close[1] ? 1 : 0
+    wins += win, losses += (1 - win)
+
+winRate = trades > 0 ? (wins / trades) * 100 : 0
+expectancy = (winRate/100 * 0.20) - ((1 - winRate/100) * 0.08)
+
+var float equity = 10000
+profit = signal and close > close[1] ? equity * 0.02 : 0
+loss   = signal and close <= close[1] ? equity * 0.01 : 0
+equity := equity + profit - loss
+
+var float peak = equity
+peak := math.max(peak, equity)
+drawdown = (equity - peak) / peak
+riskOff = drawdown < -0.10 or expectancy < 0
+
+// =====================================================
+// 💼 PORTFOLIO HEAT CONTROL (35% SWING LIMIT)
+// =====================================================
+swingLimit = 0.35 
+// If the market is crashing (Risk Off), cut max exposure in half
+maxExposure = riskOff ? (swingLimit / 2) : swingLimit 
+
+// =====================================================
+// 🚀 EXECUTION FILTER
+// =====================================================
+execute = signal and not riskOff
+
+// =====================================================
+// 📊 DASHBOARD (COMPACT VERSION)
+// =====================================================
+var table t = table.new(position.bottom_right, 2, 8, border_width=1, bgcolor=color.rgb(20, 20, 20), border_color=color.gray)
+
+if barstate.islast
+    table.cell(t, 0, 0, "V6 PRO DESK", bgcolor=color.blue, text_color=color.white, text_size=size.small)
+    table.cell(t, 0, 1, "Trades", text_color=color.gray, text_size=size.small)
+    table.cell(t, 1, 1, str.tostring(trades), text_color=color.white, text_size=size.small)
+    table.cell(t, 0, 2, "Win Rate", text_color=color.gray, text_size=size.small)
+    table.cell(t, 1, 2, str.tostring(winRate, "#.##") + "%", text_color=color.white, text_size=size.small)
+    table.cell(t, 0, 3, "RS Trend", text_color=color.gray, text_size=size.small)
+    table.cell(t, 1, 3, rsLeading ? "LEAD" : "LAG", text_color=rsLeading ? color.lime : color.red, text_size=size.small)
+    table.cell(t, 0, 4, "Equity", text_color=color.gray, text_size=size.small)
+    table.cell(t, 1, 4, str.tostring(equity, "#.##"), text_color=color.white, text_size=size.small)
+    table.cell(t, 0, 5, "Risk Mode", text_color=color.gray, text_size=size.small)
+    table.cell(t, 1, 5, riskOff ? "DEFENSE" : "NORMAL", text_color=riskOff ? color.red : color.lime, text_size=size.small)
+    table.cell(t, 0, 6, "Exposure", text_color=color.gray, text_size=size.small)
+    table.cell(t, 1, 6, str.tostring(maxExposure * 100) + "%", text_color=color.white, text_size=size.small)
+    table.cell(t, 0, 7, "Signal", text_color=color.gray, text_size=size.small)
+    table.cell(t, 1, 7, execute ? "EXECUTE" : "WAIT", text_color=execute ? color.lime : color.gray, text_size=size.small)
+
+// =====================================================
+// 🎯 PULLBACK "STRIKE ZONE" ALERT
+// =====================================================
+ema20 = ta.ema(close, 20)
+strikeZone = close <= (ema20 * 1.03) and close > ema20
+alertcondition(strikeZone, title="3% Pullback Alert", message="Stock has entered the 3% EMA 20 value zone. Ready your sniper!")

@@ -1,0 +1,298 @@
+//@version=6
+// ============================================================
+// Minervini VCP Dashboard v8 KLSE — COMPANION INDICATOR
+// ============================================================
+//
+// WHY THIS EXISTS:
+//   Pine Script v6 has a known silent failure where strategy()
+//   scripts cannot reliably render table() objects, even with
+//   force_overlay=true and hardcoded position constants.
+//   indicator() scripts do not have this restriction.
+//
+//   This companion indicator replicates all the dashboard
+//   metrics from "Minervini VCP + SmartMCDX KLSE v8" strategy
+//   and displays them as a working table.
+//
+// HOW TO USE:
+//   Add BOTH scripts to the same Daily chart:
+//     1. Minervini VCP + SmartMCDX KLSE v8  →  strategy (backtest)
+//     2. Minervini VCP Dashboard v8 KLSE     →  this indicator (table)
+//   Keep input settings identical between both scripts.
+//   The strategy handles all entry/exit/SL/TP logic.
+//   This indicator handles the visual dashboard only.
+//
+// INPUTS TO MATCH WITH STRATEGY:
+//   • KLSE Liquidity Filters (price, volume)
+//   • MCDX Smart Money Filter
+//   • Market Regime & Relative Strength
+//   • Moving Averages (lengths only — colors not needed)
+//   • Signals & VCP (tightness, vol contraction toggle)
+// ============================================================
+indicator('Minervini VCP Dashboard v8 KLSE', overlay=true, max_labels_count=0, max_lines_count=0)
+
+// ==========================================
+// 1. INPUTS  (match these with the strategy)
+// ==========================================
+
+// ── Strategy gates that feed the dashboard ──────────────────
+grp_strat = '1. Strategy Gates (match with strategy)'
+req_tpr       = input.bool(true,  'Require Full TPR (7/7)',          group=grp_strat)
+req_vcp       = input.bool(false, 'Require VCP Squeeze',             group=grp_strat)
+req_vol_surge = input.bool(true,  'Require Volume Surge',            group=grp_strat)
+vol_mult      = input.float(1.3,  'Volume Surge Multiplier', step=0.1, group=grp_strat)
+
+// ── [KLSE] Liquidity filters ─────────────────────────────────
+grp_klse     = '2. KLSE Liquidity Filters'
+min_price_rm = input.float(0.50, '[KLSE] Min Stock Price (RM)',        step=0.05,    group=grp_klse)
+min_avg_vol  = input.int(200000, '[KLSE] Min Avg Daily Volume (shares)', step=50000, group=grp_klse)
+
+// ── MCDX ─────────────────────────────────────────────────────
+grp_mcdx       = '3. MCDX Smart Money Filter'
+use_mcdx_entry = input.bool(false, 'Require Banker for Entry',         group=grp_mcdx)
+mcdx_entry_val = input.float(0.0,  'Min Banker % for Entry', step=10.0, group=grp_mcdx)
+
+// ── Market Regime & RS ────────────────────────────────────────
+grp_regime     = '4. Market Regime & Relative Strength'
+use_mkt_regime = input.bool(true, 'Require Bull Market (FBM KLCI > 200 SMA)', group=grp_regime)
+use_rs_filter  = input.bool(true, 'Require Stock Outperforms FBM KLCI',        group=grp_regime)
+rs_period      = input.int(63,    'RS Lookback Period (Bars)', minval=20,       group=grp_regime)
+bm_sym         = input.symbol('MYX:FBMKLCI', '[KLSE] Benchmark Symbol',        group=grp_regime)
+
+// ── Moving Averages (lengths only) ───────────────────────────
+grp_ma     = '5. Moving Averages'
+len_ema21  = input.int(21,  '21 EMA Length',  group=grp_ma)
+len_sma50  = input.int(50,  '50 SMA Length',  group=grp_ma)
+len_sma150 = input.int(150, '150 SMA Length', group=grp_ma)
+len_sma200 = input.int(200, '200 SMA Length', group=grp_ma)
+
+// ── Dashboard display ─────────────────────────────────────────
+grp_display     = '6. Table Display'
+table_pos_input = input.string('Top Left', 'Table Position',
+  options=['Top Left','Top Center','Top Right',
+           'Middle Left','Middle Center','Middle Right',
+           'Bottom Left','Bottom Center','Bottom Right'],
+  group=grp_display)
+table_size_input = input.string('Small', 'Table Size',
+  options=['Tiny','Small','Normal','Large','Huge'], group=grp_display)
+show_tpr_detail    = input.bool(false, 'Dashboard: TPR Condition Breakdown (C1–C7)', group=grp_display)
+show_regime_row    = input.bool(true,  'Dashboard: FBM KLCI Regime Row',             group=grp_display)
+show_rs_row        = input.bool(true,  'Dashboard: RS vs KLCI Row',                  group=grp_display)
+show_liquidity_row = input.bool(true,  'Dashboard: KLSE Liquidity Row',              group=grp_display)
+show_vcp_row       = input.bool(true,  'Dashboard: VCP Squeeze Row',                 group=grp_display)
+show_mcdx_row      = input.bool(true,  'Dashboard: MCDX / OBV Row',                  group=grp_display)
+
+// ── VCP ───────────────────────────────────────────────────────
+grp_vcp             = '7. VCP Settings'
+vcp_thresh          = input.float(3.0, '[KLSE] VCP Squeeze Tightness %', step=0.1, group=grp_vcp)
+req_vol_contraction = input.bool(true, 'Require Volume Contraction for VCP',        group=grp_vcp)
+
+// ==========================================
+// 2. CALCULATIONS  (identical to strategy)
+// ==========================================
+
+// Moving averages
+ema21  = ta.ema(close, len_ema21)
+sma50  = ta.sma(close, len_sma50)
+sma150 = ta.sma(close, len_sma150)
+sma200 = ta.sma(close, len_sma200)
+atr14  = ta.atr(14)
+
+// [KLSE-4] 52-week = 245 KLSE trading days
+klse_annual_bars = 245
+enough_bars = bar_index >= klse_annual_bars
+high_52wk   = ta.highest(high, klse_annual_bars)
+low_52wk    = ta.lowest(low,   klse_annual_bars)
+
+// Minervini 7-Condition Trend Template
+c1 = close > sma150 and close > sma200
+c2 = sma150 > sma200
+c3 = sma200 > sma200[20]
+c4 = sma50 > sma150 and sma50 > sma200
+c5 = close > sma50
+c6 = enough_bars and close > low_52wk  * 1.25
+c7 = enough_bars and close > high_52wk * 0.75
+
+tpr_pass  = c1 and c2 and c3 and c4 and c5 and c6 and c7
+tpr_score = (c1 ? 1 : 0) + (c2 ? 1 : 0) + (c3 ? 1 : 0) + (c4 ? 1 : 0) + (c5 ? 1 : 0) + (c6 ? 1 : 0) + (c7 ? 1 : 0)
+
+// VCP squeeze
+vcp_highest   = ta.highest(high, 10)
+vcp_lowest    = ta.lowest(low,  10)
+vcp_range_pct = (vcp_highest - vcp_lowest) / close * 100
+vol_ma_10     = ta.sma(volume, 10)
+vol_dry       = volume < vol_ma_10 * 0.8
+vcp_squeeze   = vcp_range_pct < vcp_thresh and (not req_vol_contraction or vol_dry)
+
+// Volume surge (vs 50-bar avg — same as strategy)
+avg_vol_50    = ta.sma(volume, 50)
+vol_surge_ok  = req_vol_surge ? (volume > avg_vol_50 * vol_mult) : true
+
+// [KLSE-1] Market Regime via FBM KLCI
+klci_close     = request.security(bm_sym, timeframe.period, close)
+klci_sma200    = request.security(bm_sym, timeframe.period, ta.sma(close, 200))
+market_is_bull = use_mkt_regime ? (not na(klci_sma200) and klci_close > klci_sma200) : true
+
+// Relative Strength vs FBM KLCI
+stock_return = not na(close[rs_period])      ? (close / close[rs_period])           : na
+klci_return  = not na(klci_close[rs_period]) ? (klci_close / klci_close[rs_period]) : na
+rs_pass = use_rs_filter ? (not na(stock_return) and not na(klci_return) and stock_return > klci_return) : true
+
+// [KLSE-5] [KLSE-6] Liquidity gates
+price_ok         = close >= min_price_rm
+vol_liquidity_ok = avg_vol_50 >= min_avg_vol
+
+// MCDX Smart Money proxy
+mcdx_rsi      = ta.rsi(close, 50)
+mcdx_mfi      = ta.mfi(hlc3, 14)
+banker_raw    = ((mcdx_rsi - 50) * 3) + ((mcdx_mfi - 50) * 2)
+banker_red    = math.max(0, math.min(100, banker_raw))
+banker_smooth = ta.ema(banker_red, 5)
+banker_val    = na(banker_smooth) ? 0 : banker_smooth
+
+mcdx_entry_cond = use_mcdx_entry ? (banker_val >= mcdx_entry_val) : true
+
+// OBV trend
+obv        = ta.obv
+obv_ma     = ta.sma(obv, 20)
+obv_rising = obv > obv_ma
+
+// ── SETUP READY signal ──────────────────────────────────────
+// Mirrors the strategy's pre-conditions (everything except the
+// actual breakout signal + base maturity which are strategy-only).
+// When SETUP READY = true, the stock is in position — wait for
+// the breakout candle to fire the strategy entry.
+valid_tpr    = req_tpr ? tpr_pass : true
+valid_vcp    = req_vcp ? vcp_squeeze : true
+setup_ready = valid_tpr and valid_vcp and vol_surge_ok and mcdx_entry_cond and market_is_bull and rs_pass and price_ok and vol_liquidity_ok
+
+// ==========================================
+// 3. TABLE COLORS
+// ==========================================
+c_bg_hdr  = color.new(#5c0000,    0)
+c_bg_lbl  = color.new(#0d1f3c,    0)
+c_bg_good = color.new(#0a3d0a,    0)
+c_bg_warn = color.new(#4a3000,    0)
+c_bg_bad  = color.new(#3d0a0a,    0)
+c_bg_neu  = color.new(#2a2a3a,    0)
+c_txt     = color.white
+c_txt_lbl = color.new(#b0b8d0,    0)
+
+// ==========================================
+// 4. DASHBOARD TABLE
+// ── indicator() → table.new() always works ─
+// ==========================================
+
+// Table size
+table_sz = switch table_size_input
+    'Tiny'  => size.tiny
+    'Large' => size.large
+    'Huge'  => size.huge
+    =>         size.small
+
+// Table position (simple string — works fine in indicator())
+hudPos = switch table_pos_input
+    'Top Left'      => position.top_left
+    'Top Center'    => position.top_center
+    'Top Right'     => position.top_right
+    'Middle Left'   => position.middle_left
+    'Middle Center' => position.middle_center
+    'Middle Right'  => position.middle_right
+    'Bottom Left'   => position.bottom_left
+    'Bottom Center' => position.bottom_center
+    =>                 position.bottom_right
+
+// Dynamic row indexing — same logic as strategy
+r8_tpr    = 1
+r8_c1     = 2
+r8_regime = r8_c1     + (show_tpr_detail    ? 7 : 0)
+r8_rs     = r8_regime + (show_regime_row    ? 1 : 0)
+r8_liq    = r8_rs     + (show_rs_row        ? 1 : 0)
+r8_vcp    = r8_liq    + (show_liquidity_row ? 1 : 0)
+r8_mcdx   = r8_vcp    + (show_vcp_row       ? 1 : 0)
+r8_signal = r8_mcdx   + (show_mcdx_row      ? 1 : 0)
+
+// Create table — var + simple string position works in indicator()
+var table dash = table.new(hudPos, 2, r8_signal + 1,
+  bgcolor      = color.new(color.black, 0),
+  border_width = 1,
+  border_color = color.new(#3a3a4a, 0))
+
+if barstate.islast or barstate.isrealtime
+    // ── Header ──────────────────────────────────────────────────────────────
+    table.cell(dash, 0, 0, 'VCP MSS v8 KLSE', text_color=c_txt, bgcolor=c_bg_hdr, text_size=table_sz)
+    table.cell(dash, 1, 0, 'STATUS',           text_color=c_txt, bgcolor=c_bg_hdr, text_size=table_sz)
+
+    // ── Minervini TPR (always shown) ─────────────────────────────────────────
+    tpr_lbl = str.tostring(tpr_score) + ' / 7  ' + (tpr_pass ? 'ALL PASS' : str.tostring(7 - tpr_score) + ' FAIL')
+    table.cell(dash, 0, r8_tpr, 'Minervini TPR',
+      text_color=c_txt_lbl, bgcolor=c_bg_lbl, text_size=table_sz)
+    table.cell(dash, 1, r8_tpr, tpr_lbl,
+      text_color=c_txt, bgcolor=tpr_pass ? c_bg_good : c_bg_warn, text_size=table_sz)
+
+    // ── C1–C7 Breakdown (optional) ───────────────────────────────────────────
+    if show_tpr_detail
+        table.cell(dash, 0, r8_c1,     'C1 Price>MA150/200', text_color=c_txt_lbl, bgcolor=c_bg_lbl,          text_size=table_sz)
+        table.cell(dash, 1, r8_c1,     c1 ? 'PASS' : 'FAIL', text_color=c_txt,     bgcolor=c1 ? c_bg_good : c_bg_bad, text_size=table_sz)
+        table.cell(dash, 0, r8_c1 + 1, 'C2 MA150 > MA200',   text_color=c_txt_lbl, bgcolor=c_bg_lbl,          text_size=table_sz)
+        table.cell(dash, 1, r8_c1 + 1, c2 ? 'PASS' : 'FAIL', text_color=c_txt,     bgcolor=c2 ? c_bg_good : c_bg_bad, text_size=table_sz)
+        table.cell(dash, 0, r8_c1 + 2, 'C3 MA200 Rising',    text_color=c_txt_lbl, bgcolor=c_bg_lbl,          text_size=table_sz)
+        table.cell(dash, 1, r8_c1 + 2, c3 ? 'PASS' : 'FAIL', text_color=c_txt,     bgcolor=c3 ? c_bg_good : c_bg_bad, text_size=table_sz)
+        table.cell(dash, 0, r8_c1 + 3, 'C4 MA50>MA150/200',  text_color=c_txt_lbl, bgcolor=c_bg_lbl,          text_size=table_sz)
+        table.cell(dash, 1, r8_c1 + 3, c4 ? 'PASS' : 'FAIL', text_color=c_txt,     bgcolor=c4 ? c_bg_good : c_bg_bad, text_size=table_sz)
+        table.cell(dash, 0, r8_c1 + 4, 'C5 Price > MA50',    text_color=c_txt_lbl, bgcolor=c_bg_lbl,          text_size=table_sz)
+        table.cell(dash, 1, r8_c1 + 4, c5 ? 'PASS' : 'FAIL', text_color=c_txt,     bgcolor=c5 ? c_bg_good : c_bg_bad, text_size=table_sz)
+        table.cell(dash, 0, r8_c1 + 5, 'C6 25% Off 52w Low', text_color=c_txt_lbl, bgcolor=c_bg_lbl,          text_size=table_sz)
+        table.cell(dash, 1, r8_c1 + 5, c6 ? 'PASS' : 'FAIL', text_color=c_txt,     bgcolor=c6 ? c_bg_good : c_bg_bad, text_size=table_sz)
+        table.cell(dash, 0, r8_c1 + 6, 'C7 Near 52w High',   text_color=c_txt_lbl, bgcolor=c_bg_lbl,          text_size=table_sz)
+        table.cell(dash, 1, r8_c1 + 6, c7 ? 'PASS' : 'FAIL', text_color=c_txt,     bgcolor=c7 ? c_bg_good : c_bg_bad, text_size=table_sz)
+
+    // ── FBM KLCI Regime (optional) ───────────────────────────────────────────
+    if show_regime_row
+        table.cell(dash, 0, r8_regime, 'FBM KLCI',
+          text_color=c_txt_lbl, bgcolor=c_bg_lbl, text_size=table_sz)
+        table.cell(dash, 1, r8_regime, market_is_bull ? 'BULL' : 'BEAR',
+          text_color=c_txt, bgcolor=market_is_bull ? c_bg_good : c_bg_bad, text_size=table_sz)
+
+    // ── RS vs KLCI (optional) ────────────────────────────────────────────────
+    if show_rs_row
+        table.cell(dash, 0, r8_rs, 'RS vs KLCI',
+          text_color=c_txt_lbl, bgcolor=c_bg_lbl, text_size=table_sz)
+        table.cell(dash, 1, r8_rs, rs_pass ? 'LEADING' : 'LAGGING',
+          text_color=c_txt, bgcolor=rs_pass ? c_bg_good : c_bg_bad, text_size=table_sz)
+
+    // ── KLSE Liquidity (optional) ─────────────────────────────────────────────
+    if show_liquidity_row
+        liq_ok  = price_ok and vol_liquidity_ok
+        liq_str = 'RM ' + str.tostring(math.round(close, 2)) + '  |  ' + str.tostring(math.round(avg_vol_50 / 1000, 0)) + 'k'
+        table.cell(dash, 0, r8_liq, 'Liquidity',
+          text_color=c_txt_lbl, bgcolor=c_bg_lbl, text_size=table_sz)
+        table.cell(dash, 1, r8_liq, liq_str,
+          text_color=c_txt, bgcolor=liq_ok ? c_bg_good : c_bg_bad, text_size=table_sz)
+
+    // ── VCP Squeeze (optional) ────────────────────────────────────────────────
+    if show_vcp_row
+        table.cell(dash, 0, r8_vcp, 'VCP Squeeze',
+          text_color=c_txt_lbl, bgcolor=c_bg_lbl, text_size=table_sz)
+        table.cell(dash, 1, r8_vcp, vcp_squeeze ? 'TIGHT' : 'LOOSE',
+          text_color=c_txt, bgcolor=vcp_squeeze ? c_bg_good : c_bg_warn, text_size=table_sz)
+
+    // ── MCDX / OBV (optional) ─────────────────────────────────────────────────
+    if show_mcdx_row
+        mcdx_str = str.tostring(math.round(banker_val, 0)) + '%  ' + (obv_rising ? 'OBV ↑' : 'OBV ↓')
+        table.cell(dash, 0, r8_mcdx, 'MCDX | OBV',
+          text_color=c_txt_lbl, bgcolor=c_bg_lbl, text_size=table_sz)
+        table.cell(dash, 1, r8_mcdx, mcdx_str,
+          text_color=c_txt,
+          bgcolor=banker_val >= 50 and obv_rising ? c_bg_good : c_bg_neu,
+          text_size=table_sz)
+
+    // ── SETUP READY (always shown — final decision row) ───────────────────────
+    // "SETUP READY" = all conditions except the actual breakout candle pass.
+    // When green: stock is coiled, wait for the breakout candle to fire the entry.
+    // The strategy will auto-enter on the breakout bar when this is green.
+    sig_bg  = setup_ready ? c_bg_good : tpr_score >= 5 ? c_bg_warn : c_bg_neu
+    sig_txt = setup_ready ? 'SETUP READY' : tpr_score >= 5 ? 'BUILDING' : 'WAIT'
+    table.cell(dash, 0, r8_signal, '► VCP SIGNAL',
+      text_color=c_txt_lbl, bgcolor=c_bg_lbl, text_size=table_sz)
+    table.cell(dash, 1, r8_signal, sig_txt,
+      text_color=c_txt, bgcolor=sig_bg, text_size=table_sz)
