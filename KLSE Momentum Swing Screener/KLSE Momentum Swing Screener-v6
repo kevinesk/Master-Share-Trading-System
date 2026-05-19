@@ -214,19 +214,6 @@ bb_width    = (bb_upper - bb_lower) / bb_basis * 100
 bb_squeeze  = bb_width < ta.percentile_linear_interpolation(bb_width, 125, 20)
 bb_mid_bull = close > bb_basis
 
-// [v6-5] VCP COIL DETECTION
-// The tightest squeeze point fires BEFORE the volume surge.
-// Logic: BB at its absolute narrowest (bottom coil_bb_pct percentile)
-//        AND volume at N-day low (supply completely dried up)
-//        AND trend is intact (stock above EMA 50 + EMA 200)
-//        AND MCDX bullish (smart money still present, optional gate)
-// This combination signals the spring is wound to maximum — breakout imminent.
-bb_at_tightest = bb_width < ta.percentile_linear_interpolation(bb_width, 125, coil_bb_pct)
-vol_at_nday_low = volume <= ta.lowest(volume, coil_vol_bars)
-coil_mcdx_ok   = coil_mcdx_gate ? mcdxBull : true
-coil_signal    = gate and bull_trend and bb_at_tightest and vol_at_nday_low and coil_mcdx_ok
-new_coil       = coil_signal and not coil_signal[1]
-
 // ============================================================
 // ATR
 // ============================================================
@@ -280,6 +267,18 @@ score := score + (isHammer         ? 1 : 0)  // [v6-4]
 // HARD GATE
 // ============================================================
 gate = dailyTrend and liquidityOk and rsPass
+
+// ============================================================
+// [v6-5] VCP COIL DETECTION — placed after gate + mcdxBull are defined
+// The tightest squeeze point fires BEFORE the volume surge.
+// BB at absolute narrowest + volume at N-day low + trend intact + MCDX bullish.
+// This combination means the spring is wound to maximum — breakout imminent.
+// ============================================================
+bb_at_tightest  = bb_width < ta.percentile_linear_interpolation(bb_width, 125, coil_bb_pct)
+vol_at_nday_low = volume <= ta.lowest(volume, coil_vol_bars)
+coil_mcdx_ok    = coil_mcdx_gate ? mcdxBull : true
+coil_signal     = gate and bull_trend and bb_at_tightest and vol_at_nday_low and coil_mcdx_ok
+new_coil        = coil_signal and not coil_signal[1]
 
 // ============================================================
 // SIGNAL GENERATION — tiered
