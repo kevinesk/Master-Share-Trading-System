@@ -1,0 +1,421 @@
+//@version=5
+// ============================================================
+// KLSE Momentum Swing Screener  v5
+// Exchange : Bursa Malaysia (KLSE)
+// Timeframe: Daily (primary) | 4H / 1H (confluence)
+// Changes  : [v5-1] Daily trend anchor via request.security
+//            [v5-2] True RS vs FBMKLCI gate + score point
+//            [v5-3] KLSE liquidity gate (min price + volume)
+//            [v5-4] EMA 200 added to score (now 0-12 scale)
+//            [v5-5] MCDX smart money proxy added to score
+//            [v5-6] Exit requires 2+ conditions (configurable)
+//            [v5-7] SL / TP locked at entry, auto-reset on exit
+//            [v5-8] Alert deduplication (fire once per state)
+//            [v5-9] Dashboard: barstate.isrealtime + dark cells
+//            [v5-10] VWAP plotted (useful on 4H/1H intraday)
+//            [v5-11] Toggleable optional dashboard rows
+//            [v5-12] Configurable HUD position via switch
+// ============================================================
+indicator("V5 KLSE Momentum Swing Screener", shorttitle="KLSE MSS v5", overlay=true, max_lines_count=20, max_labels_count=50)
+
+// ============================================================
+// INPUTS
+// ============================================================
+g1 = "Trend Filter - EMA Ribbon"
+ema9_len   = input.int(9,   "Fast EMA",   minval=1, group=g1)
+ema21_len  = input.int(21,  "Mid EMA",    minval=1, group=g1)
+ema50_len  = input.int(50,  "Slow EMA",   minval=1, group=g1)
+ema200_len = input.int(200, "Anchor EMA", minval=1, group=g1)
+
+g2 = "Momentum - RSI and StochRSI"
+rsi_len     = input.int(14, "RSI Period",        group=g2)
+rsi_low     = input.int(50, "RSI Bullish Floor", group=g2)
+rsi_high    = input.int(75, "RSI Ceiling OB",    group=g2)
+stoch_k_len = input.int(3,  "Stoch K Smooth",    group=g2)
+stoch_d_len = input.int(3,  "Stoch D Smooth",    group=g2)
+stoch_rsi_l = input.int(14, "StochRSI Length",   group=g2)
+
+g3 = "MACD Confluence"
+macd_fast = input.int(12, "MACD Fast", group=g3)
+macd_slow = input.int(26, "MACD Slow", group=g3)
+macd_sig  = input.int(9,  "Signal",    group=g3)
+
+g4 = "Volume Analysis"
+vol_ma_len  = input.int(20,    "Volume MA Period",        group=g4)
+vol_surge_x = input.float(1.5, "Volume Surge Multiplier", group=g4, step=0.1)
+
+g5 = "ADX Trend Strength"
+adx_len       = input.int(14, "ADX Length",       group=g5)
+adx_threshold = input.int(20, "ADX Min Strength", group=g5)
+
+g6 = "Bollinger Band"
+bb_len  = input.int(20,    "BB Period", group=g6)
+bb_mult = input.float(2.0, "BB StdDev", group=g6)
+
+g7 = "Risk Management ATR"
+atr_len     = input.int(14,    "ATR Period",            group=g7)
+atr_sl_mult = input.float(1.5, "Stop-Loss ATR x",       group=g7)
+atr_tp_mult = input.float(2.5, "Take-Profit ATR x",     group=g7)
+
+// [v5-1] [v5-2] [v5-3] KLSE-specific filters
+g8 = "KLSE Filters"
+idx       = input.symbol("MYX:FBMKLCI", "Market Index (True RS)",   group=g8)
+use_rs    = input.bool(true,   "Enable True RS Filter vs KLCI",     group=g8)
+min_price = input.float(0.50,  "Min Price (RM)",                    group=g8)
+min_vol   = input.int(200000,  "Min Avg Volume (shares)",           group=g8)
+exit_min  = input.int(3,       "Exit: min conditions required (1-4)", group=g8, minval=1, maxval=4)
+
+g9 = "Display"
+show_dash      = input.bool(true,  "Show Dashboard",              group=g9)
+show_levels    = input.bool(true,  "Show Locked SL / TP Lines",   group=g9)
+show_daily_row = input.bool(true,  "Dashboard: Daily Anchor Row", group=g9)
+show_rs_row    = input.bool(true,  "Dashboard: True RS Row",      group=g9)
+show_liq_row   = input.bool(true,  "Dashboard: Liquidity Row",    group=g9)
+show_mcdx_row  = input.bool(true,  "Dashboard: MCDX Row",        group=g9)
+hudPosStr      = input.string("Top Right", "HUD Position", options=["Top Left","Top Center","Top Right","Bottom Left","Bottom Center","Bottom Right"], group=g9)
+
+// ============================================================
+// COLOURS
+// ============================================================
+c_good  = color.new(#00E676, 0)
+c_mid   = color.new(#69F0AE, 0)
+c_warn  = color.new(#FFD740, 0)
+c_bad   = color.new(#FF5252, 0)
+c_blue  = color.new(#58A6FF, 0)
+c_gray  = color.new(#8B949E, 0)
+c_white = color.new(#FFFFFF, 0)
+c_amber = color.new(#E3B341, 0)
+c_hdr   = color.new(#1F2937, 0)
+c_bg    = color.new(#0D1117, 0)
+c_dark  = color.new(#161B22, 0)
+c_yes   = color.new(#0D3320, 0)
+c_no    = color.new(#3D0C0C, 0)
+
+// ============================================================
+// [v5-3] KLSE LIQUIDITY GATE — anchored to DAILY volume
+// Bug fix: avgVol was using chart-TF bar volume, which is tiny
+// on 1H/5m and causes false THIN reads for liquid stocks.
+// d_avg_vol pulls the 20-day average volume from the daily TF,
+// so the liquidity gate is always correct on any timeframe.
+// avgVol (chart TF) is kept separately for vol_surge detection.
+// ============================================================
+avgVol      = ta.sma(volume, vol_ma_len)
+d_avg_vol   = request.security(syminfo.tickerid, "D", ta.sma(volume, vol_ma_len), lookahead=barmerge.lookahead_off)
+liquidityOk = close >= min_price and d_avg_vol >= min_vol
+
+// ============================================================
+// [v5-1] DAILY TREND ANCHOR (works on 4H / 1H / 5m too)
+// Pulls EMA 50 > 150 > 200 stack from the Daily timeframe
+// regardless of which chart timeframe is active.
+// ============================================================
+f_daily_trend() =>
+    _e50  = ta.ema(close, 50)
+    _e150 = ta.ema(close, 150)
+    _e200 = ta.ema(close, 200)
+    not na(_e50) and not na(_e150) and not na(_e200) and close > _e200 and _e50 > _e150 and _e150 > _e200
+
+dailyTrend = request.security(syminfo.tickerid, "D", f_daily_trend(), lookahead=barmerge.lookahead_off)
+
+// ============================================================
+// [v5-2] TRUE RELATIVE STRENGTH vs FBMKLCI
+// Ratio of stock price / index price, smoothed.
+// strongRS = stock outperforming the market.
+// ============================================================
+idxClose = request.security(idx, timeframe.period, close, lookahead=barmerge.lookahead_off)
+trueRS   = close / idxClose
+strongRS = trueRS > ta.sma(trueRS, 50)
+rsPass   = use_rs ? strongRS : true
+
+// ============================================================
+// GROUP 1 — EMA RIBBON
+// ============================================================
+ema9   = ta.ema(close, ema9_len)
+ema21  = ta.ema(close, ema21_len)
+ema50  = ta.ema(close, ema50_len)
+ema200 = ta.ema(close, ema200_len)
+
+plot(ema9,   title="EMA Fast",   color=color.new(#00E5FF, 0),  linewidth=1)
+plot(ema21,  title="EMA Mid",    color=color.new(#FFEB3B, 0),  linewidth=1)
+plot(ema50,  title="EMA Slow",   color=color.new(#FF9800, 0),  linewidth=2)
+plot(ema200, title="EMA Anchor", color=color.new(#FF5252, 20), linewidth=2)
+
+// [v5-4] bull_trend now requires price > BOTH EMA50 AND EMA200
+bull_trend     = close > ema50 and close > ema200
+ema_cross_bull = ta.crossover(ema9, ema21)
+// [v5-4] ema_aligned now includes EMA200 in the stack check
+ema_aligned    = ema9 > ema21 and ema21 > ema50 and ema50 > ema200
+
+// ============================================================
+// GROUP 2 — RSI + STOCHRSI
+// ============================================================
+rsi       = ta.rsi(close, rsi_len)
+rsi_min   = ta.lowest(rsi, stoch_rsi_l)
+rsi_max   = ta.highest(rsi, stoch_rsi_l)
+stoch_rsi = (rsi - rsi_min) / math.max(rsi_max - rsi_min, 0.001) * 100
+k_stoch   = ta.sma(stoch_rsi, stoch_k_len)
+d_stoch   = ta.sma(k_stoch, stoch_d_len)
+
+rsi_bullish    = rsi >= rsi_low and rsi <= rsi_high
+stoch_cross_up = ta.crossover(k_stoch, d_stoch) and k_stoch < 80
+
+// ============================================================
+// GROUP 3 — MACD
+// ============================================================
+[macdLine, signalLine, histLine] = ta.macd(close, macd_fast, macd_slow, macd_sig)
+
+macd_bullish     = macdLine > signalLine
+macd_cross_up    = ta.crossover(macdLine, signalLine)
+macd_hist_rising = histLine > histLine[1]
+
+// ============================================================
+// GROUP 4 — VOLUME + OBV
+// ============================================================
+vol_surge    = volume > avgVol * vol_surge_x
+vol_obv      = ta.obv
+vol_obv_ema  = ta.ema(vol_obv, 20)
+vol_obv_bull = vol_obv > vol_obv_ema
+
+// ============================================================
+// GROUP 5 — ADX
+// ============================================================
+[diplus, diminus, adx_val] = ta.dmi(adx_len, adx_len)
+adx_valid  = adx_val >= adx_threshold
+di_bullish = diplus > diminus
+
+// ============================================================
+// GROUP 6 — BOLLINGER BAND
+// ============================================================
+bb_basis    = ta.sma(close, bb_len)
+bb_dev      = ta.stdev(close, bb_len)
+bb_upper    = bb_basis + bb_mult * bb_dev
+bb_lower    = bb_basis - bb_mult * bb_dev
+bb_width    = (bb_upper - bb_lower) / bb_basis * 100
+bb_squeeze  = bb_width < ta.percentile_linear_interpolation(bb_width, 125, 20)
+bb_mid_bull = close > bb_basis
+
+// ============================================================
+// GROUP 7 — ATR
+// ============================================================
+atr_val = ta.atr(atr_len)
+
+// ============================================================
+// [v5-5] MCDX SMART MONEY PROXY
+// RSI(14) + MFI(14) composite. Positive = institutional buying.
+// Range: roughly -250 to +250. Zero-cross is the key signal.
+// ============================================================
+mcdx     = ((ta.rsi(close, 14) - 50) * 3) + ((ta.mfi(hlc3, 14) - 50) * 2)
+mcdxBull = mcdx > 0
+
+// ============================================================
+// [v5-10] VWAP (intraday anchor — resets each day)
+// Meaningful on 4H / 1H / 5m. On daily: use as reference only.
+// ============================================================
+vwapVal   = ta.vwap(hlc3)
+aboveVwap = close > vwapVal
+plot(vwapVal, title="VWAP", color=color.new(#00BCD4, 40), linewidth=1, style=plot.style_circles)
+
+// ============================================================
+// SCORING ENGINE (0-12)
+// Two new points vs v4: MCDX bull [v5-5] and True RS [v5-2]
+// ============================================================
+score = 0
+score := score + (ema_aligned      ? 1 : 0)   // EMA stack 9>21>50>200
+score := score + (bull_trend       ? 1 : 0)   // Price > EMA50 AND EMA200
+score := score + (rsi_bullish      ? 1 : 0)   // RSI 50-75 sweet spot
+score := score + (macd_bullish     ? 1 : 0)   // MACD above signal
+score := score + (macd_hist_rising ? 1 : 0)   // Histogram expanding
+score := score + (vol_surge        ? 1 : 0)   // Volume 1.5x+ surge
+score := score + (vol_obv_bull     ? 1 : 0)   // OBV accumulation trend
+score := score + (adx_valid        ? 1 : 0)   // ADX >= threshold
+score := score + (di_bullish       ? 1 : 0)   // DI+ > DI-
+score := score + (bb_mid_bull      ? 1 : 0)   // Above BB midline
+score := score + (mcdxBull         ? 1 : 0)   // [v5-5] MCDX smart money
+score := score + (strongRS         ? 1 : 0)   // [v5-2] RS leads KLCI
+
+// ============================================================
+// [v5-1][v5-2][v5-3] HARD GATE (all 3 must pass for any signal)
+// gate does NOT fire even on score=12 if daily/RS/liq fail.
+// ============================================================
+gate = dailyTrend and liquidityOk and rsPass
+
+// ============================================================
+// SIGNAL GENERATION — tiered with gate
+// Tier thresholds scaled for 12-pt system (was 10-pt in v4)
+// T1: 10/12 = 83%  (was 8/10 = 80%)
+// T2:  8/12 = 67%  (was 6/10 = 60%)
+// T3:  6/12 = 50%  (was 5/10 = 50%)
+// ============================================================
+tier1_buy   = gate and score >= 10 and (ema_cross_bull or macd_cross_up or stoch_cross_up) and vol_surge and adx_valid and rsi_bullish and bull_trend
+tier2_buy   = gate and score >= 8  and macd_bullish and vol_surge and rsi_bullish and bull_trend and not tier1_buy
+tier3_watch = gate and score >= 6  and (bb_squeeze or stoch_cross_up) and bull_trend and not tier1_buy and not tier2_buy
+
+// [v5-8] Deduplicated — fire only on first bar of each new state
+new_t1 = tier1_buy   and not tier1_buy[1]
+new_t2 = tier2_buy   and not tier2_buy[1]
+new_t3 = tier3_watch and not tier3_watch[1]
+
+// [v5-6] EXIT: requires exit_min conditions simultaneously (default 3)
+// [v5-6b] DEBOUNCE: exit_signal must be true for 2 consecutive bars
+// This prevents rapid toggling from 1H/5m micro-swings flooding the
+// chart with EXIT labels. A genuine reversal persists; a 1-bar spike does not.
+exit_c1     = ta.crossunder(ema9, ema21) ? 1 : 0
+exit_c2     = rsi > 80 ? 1 : 0
+exit_c3     = macdLine < signalLine and macdLine[1] >= signalLine[1] ? 1 : 0
+exit_c4     = close < ema21 ? 1 : 0
+exit_score  = exit_c1 + exit_c2 + exit_c3 + exit_c4
+exit_raw    = exit_score >= exit_min
+exit_signal = exit_raw and exit_raw[1]
+new_exit    = exit_signal and not exit_signal[1]
+
+// ============================================================
+// [v5-7] LOCKED SL / TP — fixed at entry, not recalculated
+// Resets when price hits SL or exit_signal fires.
+// ============================================================
+var float sl_locked  = na
+var float tp1_locked = na
+var float tp2_locked = na
+
+if new_t1 or new_t2
+    sl_locked  := close - atr_val * atr_sl_mult
+    tp1_locked := close + atr_val * atr_tp_mult
+    tp2_locked := close + atr_val * atr_tp_mult * 1.6
+
+if exit_signal or (not na(sl_locked) and close < sl_locked)
+    sl_locked  := na
+    tp1_locked := na
+    tp2_locked := na
+
+// ============================================================
+// VISUAL SIGNALS
+// ============================================================
+plotshape(new_t1,   title="T1 BUY", style=shape.labelup,    location=location.belowbar, color=color.new(#00E676, 0),  textcolor=color.white, text="T1",   size=size.normal)
+plotshape(new_t2,   title="T2 BUY", style=shape.triangleup, location=location.belowbar, color=color.new(#69F0AE, 10), textcolor=color.white,              size=size.small)
+plotshape(new_t3,   title="WATCH",  style=shape.diamond,    location=location.belowbar, color=color.new(#FFD740, 20), textcolor=color.white,              size=size.tiny)
+plotshape(new_exit, title="EXIT",   style=shape.labeldown,  location=location.abovebar, color=color.new(#FF5252, 10), textcolor=color.white, text="EXIT", size=size.small)
+
+bgcolor(tier1_buy   ? color.new(#00E676, 93) : na, title="T1 BG")
+bgcolor(tier2_buy   ? color.new(#69F0AE, 93) : na, title="T2 BG")
+bgcolor(exit_signal ? color.new(#FF5252, 93) : na, title="Exit BG")
+
+// [v5-7] Locked level lines (linebr = break when na)
+plot(show_levels and not na(sl_locked)  ? sl_locked  : na, title="Stop Loss",    color=color.new(#FF5252, 0), linewidth=1, style=plot.style_linebr)
+plot(show_levels and not na(tp1_locked) ? tp1_locked : na, title="Take Profit 1", color=color.new(#00E676, 0), linewidth=1, style=plot.style_linebr)
+plot(show_levels and not na(tp2_locked) ? tp2_locked : na, title="Take Profit 2", color=color.new(#FFD740, 0), linewidth=1, style=plot.style_linebr)
+
+// ============================================================
+// [v5-11][v5-12] HUD — DYNAMIC ROW WIRING
+// Always-on: header, score, 7 factor rows, signal, risk = 12
+// Optional:  daily(1) + rs(1) + liq(1) + mcdx(1) = up to 4
+// Max total rows: 16
+// ============================================================
+r_hdr   = 0
+r_score = 1
+r_ema   = 2
+r_trend = 3
+r_rsi   = 4
+r_macd  = 5
+r_vol   = 6
+r_adx   = 7
+r_bb    = 8
+r_daily = 9
+r_rs    = r_daily + (show_daily_row ? 1 : 0)
+r_liq   = r_rs    + (show_rs_row    ? 1 : 0)
+r_mcdx  = r_liq   + (show_liq_row   ? 1 : 0)
+r_sig   = r_mcdx  + (show_mcdx_row  ? 1 : 0)
+r_risk  = r_sig   + 1
+hud_rows = r_risk + 1
+
+// [v5-12] Position resolved via switch (simple string — valid for table.new)
+hudPos = switch hudPosStr
+    "Top Left"      => position.top_left
+    "Top Center"    => position.top_center
+    "Top Right"     => position.top_right
+    "Bottom Left"   => position.bottom_left
+    "Bottom Center" => position.bottom_center
+    => position.bottom_right
+
+var table dash = table.new(hudPos, 2, hud_rows, bgcolor=c_bg, border_color=color.new(#30363D, 0), border_width=1, frame_color=c_blue, frame_width=2)
+
+// Helper: generic cell writer
+f_cell(c, r, txt, bg, fg) =>
+    table.cell(dash, c, r, txt, bgcolor=bg, text_color=fg, text_size=size.small, text_halign=text.align_center)
+
+// Helper: YES/NO factor row
+f_row(r, lbl, cond) =>
+    table.cell(dash, 0, r, lbl,                     bgcolor=c_dark, text_color=c_gray,                    text_size=size.small, text_halign=text.align_left)
+    table.cell(dash, 1, r, cond ? "[YES]" : "[NO]", bgcolor=cond ? c_yes : c_no, text_color=cond ? c_good : c_bad, text_size=size.small, text_halign=text.align_center)
+
+// [v5-9] Live refresh on every tick, not just bar close
+if show_dash and (barstate.islast or barstate.isrealtime)
+
+    // Header
+    f_cell(0, r_hdr,   "KLSE MSS v5  --  Swing Scorecard", c_hdr, c_blue)
+    f_cell(1, r_hdr,   "Status",                            c_hdr, c_blue)
+
+    // Score with colour-coded threshold bands
+    sc = score
+    score_col = sc >= 10 ? c_good : sc >= 8 ? c_mid : sc >= 6 ? c_warn : c_bad
+    f_cell(0, r_score, "SCORE (0 - 12)",              c_dark, c_gray)
+    f_cell(1, r_score, str.tostring(sc) + " / 12",    score_col, c_white)
+
+    // Always-on factor rows
+    f_row(r_ema,   "EMA 9 > 21 > 50 > 200",          ema_aligned)
+    f_row(r_trend, "Price > EMA 50 and EMA 200",      bull_trend)
+    f_row(r_rsi,   "RSI 50 - 75 Zone",                rsi_bullish)
+    f_row(r_macd,  "MACD Bull and Hist Rising",       macd_bullish and macd_hist_rising)
+    f_row(r_vol,   "Volume Surge and OBV Accum",      vol_surge and vol_obv_bull)
+    f_row(r_adx,   "ADX Strong and DI+ > DI-",       adx_valid and di_bullish)
+    f_row(r_bb,    "Above BB Midline",                bb_mid_bull)
+
+    // Optional rows (show_xxx_row toggles)
+    if show_daily_row
+        f_row(r_daily, "Daily Trend Anchor (EMA stack)", dailyTrend)
+
+    if show_rs_row
+        f_row(r_rs, use_rs ? "True RS > KLCI (active)" : "True RS (disabled)", strongRS)
+
+    if show_liq_row
+        f_row(r_liq, "KLSE Liquidity (Price + Vol)", liquidityOk)
+
+    if show_mcdx_row
+        mcdx_lbl = "MCDX " + str.tostring(math.round(mcdx)) + (mcdxBull ? "  BULL" : "  BEAR")
+        table.cell(dash, 0, r_mcdx, "MCDX Smart Money", bgcolor=c_dark, text_color=c_gray, text_size=size.small, text_halign=text.align_left)
+        table.cell(dash, 1, r_mcdx, mcdx_lbl, bgcolor=mcdxBull ? c_yes : c_no, text_color=mcdxBull ? c_good : c_bad, text_size=size.small, text_halign=text.align_center)
+
+    // Signal row
+    sig_txt = tier1_buy ? "T1  HIGH CONVICTION" : tier2_buy ? "T2  MOMENTUM BUY" : tier3_watch ? "WATCHLIST" : exit_signal ? "EXIT  --  AVOID" : "NEUTRAL"
+    sig_col = tier1_buy ? c_good : tier2_buy ? c_mid : tier3_watch ? c_warn : exit_signal ? c_bad : c_gray
+    f_cell(0, r_sig, "SIGNAL",  c_bg,    c_gray)
+    f_cell(1, r_sig, sig_txt,   sig_col, c_white)
+
+    // Locked risk levels row
+    sl_str  = not na(sl_locked)  ? str.tostring(math.round(sl_locked,  3)) : "--"
+    tp1_str = not na(tp1_locked) ? str.tostring(math.round(tp1_locked, 3)) : "--"
+    tp2_str = not na(tp2_locked) ? str.tostring(math.round(tp2_locked, 3)) : "--"
+    f_cell(0, r_risk, "SL  /  TP1  /  TP2",                             c_hdr, c_gray)
+    f_cell(1, r_risk, sl_str + "  /  " + tp1_str + "  /  " + tp2_str,  c_hdr, c_amber)
+
+// ============================================================
+// [v5-8] ALERTS — deduplicated, fire once per state change
+// ============================================================
+alertcondition(new_t1,   title="T1 HIGH CONVICTION BUY",  message="KLSE MSS v5 | {{ticker}} | TIER 1 | Price={{close}} | Daily+RS+Liq confirmed | Score>=10")
+alertcondition(new_t2,   title="T2 MOMENTUM BUY",         message="KLSE MSS v5 | {{ticker}} | TIER 2 | Price={{close}} | Score>=8")
+alertcondition(new_t3,   title="WATCHLIST PRE-BREAKOUT",  message="KLSE MSS v5 | {{ticker}} | WATCHLIST | Price={{close}} | Score>=6 squeeze forming")
+alertcondition(new_exit, title="EXIT SIGNAL",             message="KLSE MSS v5 | {{ticker}} | EXIT | Price={{close}} | Multiple exit conditions met")
+
+// ============================================================
+// HIDDEN PLOTS (Pine Screener / strategy export)
+// ============================================================
+plot(score,               title="Score 0-12",   display=display.none)
+plot(rsi,                 title="RSI Value",    display=display.none)
+plot(adx_val,             title="ADX Value",    display=display.none)
+plot(mcdx,                title="MCDX Value",   display=display.none)
+plot(new_t1   ? 1 : 0,   title="Tier1 Signal", display=display.none)
+plot(new_t2   ? 1 : 0,   title="Tier2 Signal", display=display.none)
+plot(vol_surge ? 1 : 0,   title="Vol Surge",    display=display.none)
+plot(dailyTrend ? 1 : 0,  title="Daily Trend",  display=display.none)
+plot(strongRS   ? 1 : 0,  title="RS vs KLCI",   display=display.none)
+
+// ============================================================
+// END OF SCRIPT
+// ============================================================

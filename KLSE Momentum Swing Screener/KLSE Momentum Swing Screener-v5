@@ -1,0 +1,317 @@
+// ============================================================
+// KLSE Daily Momentum Screener -- Swing Trade (1-2 Days)
+// Version : 4.0  |  Pine Script v5
+// Exchange : Bursa Malaysia (KLSE)
+// Fix      : All Unicode chars replaced with ASCII-safe text
+// ============================================================
+
+//@version=5
+indicator(title="KLSE Momentum Swing Screener", shorttitle="KLSE MSS", overlay=true, max_lines_count=10, max_labels_count=50)
+
+// ─────────────────────────────────────────────
+// GROUP 1 -- TREND FILTER (EMA Ribbon)
+// ─────────────────────────────────────────────
+g1 = "Trend Filter - EMA Ribbon"
+ema9_len   = input.int(9,   "Fast EMA",   minval=1, group=g1)
+ema21_len  = input.int(21,  "Mid EMA",    minval=1, group=g1)
+ema50_len  = input.int(50,  "Slow EMA",   minval=1, group=g1)
+ema200_len = input.int(200, "Anchor EMA", minval=1, group=g1)
+
+ema9   = ta.ema(close, ema9_len)
+ema21  = ta.ema(close, ema21_len)
+ema50  = ta.ema(close, ema50_len)
+ema200 = ta.ema(close, ema200_len)
+
+plot(ema9,   title="EMA 9",   color=color.new(#00E5FF, 0),  linewidth=1)
+plot(ema21,  title="EMA 21",  color=color.new(#FFEB3B, 0),  linewidth=1)
+plot(ema50,  title="EMA 50",  color=color.new(#FF9800, 0),  linewidth=2)
+plot(ema200, title="EMA 200", color=color.new(#FF5252, 20), linewidth=2)
+
+bull_trend     = close > ema50
+ema_cross_bull = ta.crossover(ema9, ema21)
+ema_aligned    = ema9 > ema21 and ema21 > ema50
+
+// ─────────────────────────────────────────────
+// GROUP 2 -- MOMENTUM (RSI + StochRSI)
+// ─────────────────────────────────────────────
+g2 = "Momentum - RSI and StochRSI"
+rsi_len     = input.int(14, "RSI Period",        group=g2)
+rsi_low     = input.int(50, "RSI Bullish Floor", group=g2)
+rsi_high    = input.int(75, "RSI Ceiling OB",    group=g2)
+stoch_k_len = input.int(3,  "Stoch K Smooth",    group=g2)
+stoch_d_len = input.int(3,  "Stoch D Smooth",    group=g2)
+stoch_rsi_l = input.int(14, "StochRSI Length",   group=g2)
+
+rsi       = ta.rsi(close, rsi_len)
+rsi_min   = ta.lowest(rsi, stoch_rsi_l)
+rsi_max   = ta.highest(rsi, stoch_rsi_l)
+stoch_rsi = (rsi - rsi_min) / math.max(rsi_max - rsi_min, 0.001) * 100
+k         = ta.sma(stoch_rsi, stoch_k_len)
+d         = ta.sma(k, stoch_d_len)
+
+rsi_bullish    = rsi >= rsi_low and rsi <= rsi_high
+stoch_cross_up = ta.crossover(k, d) and k < 80
+
+// ─────────────────────────────────────────────
+// GROUP 3 -- MACD CONFLUENCE
+// ─────────────────────────────────────────────
+g3 = "MACD Confluence"
+macd_fast = input.int(12, "MACD Fast", group=g3)
+macd_slow = input.int(26, "MACD Slow", group=g3)
+macd_sig  = input.int(9,  "Signal",    group=g3)
+
+[macdLine, signalLine, histLine] = ta.macd(close, macd_fast, macd_slow, macd_sig)
+
+macd_bullish     = macdLine > signalLine
+macd_cross_up    = ta.crossover(macdLine, signalLine)
+macd_hist_rising = histLine > histLine[1]
+
+// ─────────────────────────────────────────────
+// GROUP 4 -- VOLUME ANALYSIS
+// ─────────────────────────────────────────────
+g4 = "Volume Analysis"
+vol_ma_len  = input.int(20,    "Volume MA Period",        group=g4)
+vol_surge_x = input.float(1.5, "Volume Surge Multiplier", group=g4, step=0.1)
+
+vol_ma       = ta.sma(volume, vol_ma_len)
+vol_surge    = volume > vol_ma * vol_surge_x
+vol_obv      = ta.obv
+vol_obv_ema  = ta.ema(vol_obv, 20)
+vol_obv_bull = vol_obv > vol_obv_ema
+
+// ─────────────────────────────────────────────
+// GROUP 5 -- ADX TREND STRENGTH
+// ─────────────────────────────────────────────
+g5 = "ADX Trend Strength"
+adx_len       = input.int(14, "ADX Length",       group=g5)
+adx_threshold = input.int(20, "ADX Min Strength", group=g5)
+
+[diplus, diminus, adx] = ta.dmi(adx_len, adx_len)
+
+adx_valid  = adx >= adx_threshold
+di_bullish = diplus > diminus
+
+// ─────────────────────────────────────────────
+// GROUP 6 -- BOLLINGER BAND
+// ─────────────────────────────────────────────
+g6 = "Bollinger Band Breakout"
+bb_len  = input.int(20,    "BB Period", group=g6)
+bb_mult = input.float(2.0, "BB StdDev", group=g6)
+
+bb_basis = ta.sma(close, bb_len)
+bb_dev   = ta.stdev(close, bb_len)
+bb_upper = bb_basis + bb_mult * bb_dev
+bb_lower = bb_basis - bb_mult * bb_dev
+bb_width = (bb_upper - bb_lower) / bb_basis * 100
+
+bb_squeeze  = bb_width < ta.percentile_linear_interpolation(bb_width, 125, 20)
+bb_mid_bull = close > bb_basis
+
+// ─────────────────────────────────────────────
+// GROUP 7 -- ATR RISK MANAGEMENT
+// ─────────────────────────────────────────────
+g7 = "Risk Management ATR"
+atr_len     = input.int(14,    "ATR Period",        group=g7)
+atr_sl_mult = input.float(1.5, "Stop-Loss ATR x",   group=g7)
+atr_tp_mult = input.float(2.5, "Take-Profit ATR x", group=g7)
+
+atr      = ta.atr(atr_len)
+sl_level = close - atr * atr_sl_mult
+tp1      = close + atr * atr_tp_mult
+tp2      = close + atr * atr_tp_mult * 1.6
+
+// ─────────────────────────────────────────────
+// SCORING ENGINE (0-10 pts)
+// ─────────────────────────────────────────────
+score = 0
+score := score + (ema_aligned      ? 1 : 0)
+score := score + (bull_trend       ? 1 : 0)
+score := score + (rsi_bullish      ? 1 : 0)
+score := score + (macd_bullish     ? 1 : 0)
+score := score + (macd_hist_rising ? 1 : 0)
+score := score + (vol_surge        ? 1 : 0)
+score := score + (vol_obv_bull     ? 1 : 0)
+score := score + (adx_valid        ? 1 : 0)
+score := score + (di_bullish       ? 1 : 0)
+score := score + (bb_mid_bull      ? 1 : 0)
+
+// ─────────────────────────────────────────────
+// SIGNAL GENERATION
+// ─────────────────────────────────────────────
+tier1_buy = score >= 8 and
+     (ema_cross_bull or macd_cross_up or stoch_cross_up) and
+     vol_surge and adx_valid and rsi_bullish and bull_trend
+
+tier2_buy = score >= 6 and
+     macd_bullish and vol_surge and rsi_bullish and bull_trend and
+     not tier1_buy
+
+tier3_watch = score >= 5 and
+     (bb_squeeze or stoch_cross_up) and bull_trend and
+     not tier1_buy and not tier2_buy
+
+exit_signal = ta.crossunder(ema9, ema21) or
+     rsi > 80 or
+     (macdLine < signalLine and macdLine[1] >= signalLine[1]) or
+     close < ema21
+
+// ─────────────────────────────────────────────
+// VISUAL SIGNALS
+// ─────────────────────────────────────────────
+plotshape(tier1_buy, title="T1 BUY",
+     style=shape.labelup, location=location.belowbar,
+     color=color.new(#00E676, 0), textcolor=color.white,
+     text="T1 BUY", size=size.normal)
+
+plotshape(tier2_buy, title="T2 BUY",
+     style=shape.triangleup, location=location.belowbar,
+     color=color.new(#69F0AE, 10), textcolor=color.white,
+     size=size.small)
+
+plotshape(tier3_watch, title="WATCH",
+     style=shape.diamond, location=location.belowbar,
+     color=color.new(#FFD740, 20), textcolor=color.white,
+     size=size.tiny)
+
+plotshape(exit_signal, title="EXIT",
+     style=shape.labeldown, location=location.abovebar,
+     color=color.new(#FF5252, 10), textcolor=color.white,
+     text="EXIT", size=size.small)
+
+bgcolor(tier1_buy   ? color.new(#00E676, 93) : na, title="Tier1 BG")
+bgcolor(tier2_buy   ? color.new(#69F0AE, 93) : na, title="Tier2 BG")
+bgcolor(exit_signal ? color.new(#FF5252, 93) : na, title="Exit BG")
+
+// ─────────────────────────────────────────────
+// DASHBOARD TABLE
+// ─────────────────────────────────────────────
+g_disp      = "Display Options"
+show_dash   = input.bool(true, "Show Dashboard",    group=g_disp)
+show_levels = input.bool(true, "Show SL/TP Levels", group=g_disp)
+
+var table dash = table.new(position.top_right, 2, 14,
+     bgcolor      = color.new(#0D1117, 5),
+     border_color = color.new(#30363D, 0),
+     border_width = 1,
+     frame_color  = color.new(#58A6FF, 0),
+     frame_width  = 2)
+
+// Generic cell writer -- must be at global scope
+f_cell(c, r, txt, bg, fg) =>
+    table.cell(dash, c, r, txt,
+         bgcolor     = bg,
+         text_color  = fg,
+         text_size   = size.small,
+         text_halign = text.align_center)
+
+// Label + YES/NO row -- must be at global scope (Pine v5 rule)
+f_row(r, lbl, cond) =>
+    table.cell(dash, 0, r, lbl,
+         bgcolor     = color.new(#161B22, 0),
+         text_color  = color.new(#8B949E, 0),
+         text_size   = size.small,
+         text_halign = text.align_left)
+    table.cell(dash, 1, r, cond ? "[YES]" : "[NO]",
+         bgcolor     = cond ? color.new(#0D3320, 0) : color.new(#3D0C0C, 0),
+         text_color  = cond ? color.new(#00E676, 0) : color.new(#FF5252, 0),
+         text_size   = size.small,
+         text_halign = text.align_center)
+
+if show_dash and barstate.islast
+    // Header row
+    f_cell(0, 0, "KLSE MSS -- Momentum Scorecard",
+         color.new(#1F2937, 0), color.new(#58A6FF, 0))
+    f_cell(1, 0, "Status",
+         color.new(#1F2937, 0), color.new(#58A6FF, 0))
+
+    // Score row
+    sc        = score
+    score_col = sc >= 8 ? color.new(#00E676, 0) :
+                 sc >= 6 ? color.new(#69F0AE, 0) :
+                 sc >= 5 ? color.new(#FFD740, 0) :
+                 color.new(#FF5252, 0)
+    f_cell(0, 1, "SCORE", color.new(#161B22, 0), color.new(#8B949E, 0))
+    f_cell(1, 1, str.tostring(sc) + " / 10", score_col, color.white)
+
+    // Factor rows 2-11
+    f_row(2,  "EMA Aligned (9>21>50)", ema_aligned)
+    f_row(3,  "Price > EMA 50",        bull_trend)
+    f_row(4,  "RSI 50-75 Zone",        rsi_bullish)
+    f_row(5,  "MACD Bullish",          macd_bullish)
+    f_row(6,  "MACD Hist Rising",      macd_hist_rising)
+    f_row(7,  "Volume Surge 1.5x",     vol_surge)
+    f_row(8,  "OBV Accumulation",      vol_obv_bull)
+    f_row(9,  "ADX >= 20",             adx_valid)
+    f_row(10, "DI+ > DI-",             di_bullish)
+    f_row(11, "BB Midline Hold",       bb_mid_bull)
+
+    // Signal label row
+    sig_txt = tier1_buy   ? "T1 - HIGH CONVICTION" :
+               tier2_buy   ? "T2 - MOMENTUM BUY"    :
+               tier3_watch ? "WATCHLIST - FORMING"  :
+               exit_signal ? "EXIT - AVOID"         :
+               "NEUTRAL"
+    sig_col = tier1_buy   ? color.new(#00E676, 0) :
+               tier2_buy   ? color.new(#69F0AE, 0) :
+               tier3_watch ? color.new(#FFD740, 0) :
+               exit_signal ? color.new(#FF5252, 0) :
+               color.new(#8B949E, 0)
+    f_cell(0, 12, "SIGNAL", color.new(#0D1117, 0), color.new(#8B949E, 0))
+    f_cell(1, 12, sig_txt,  sig_col,                color.white)
+
+    // Risk levels row
+    f_cell(0, 13, "SL / TP1 / TP2",
+         color.new(#1F2937, 0), color.new(#8B949E, 0))
+    f_cell(1, 13,
+         str.tostring(math.round(sl_level, 3)) + " / " +
+         str.tostring(math.round(tp1, 3))      + " / " +
+         str.tostring(math.round(tp2, 3)),
+         color.new(#1F2937, 0), color.new(#E3B341, 0))
+
+// ─────────────────────────────────────────────
+// ATR RISK LINES ON CHART
+// ─────────────────────────────────────────────
+var line sl_line  = na
+var line tp1_line = na
+var line tp2_line = na
+
+if (tier1_buy or tier2_buy) and show_levels
+    sl_line  := line.new(bar_index, sl_level, bar_index + 5, sl_level,
+                 color=color.new(#FF5252, 0), style=line.style_dashed, width=1)
+    tp1_line := line.new(bar_index, tp1,      bar_index + 5, tp1,
+                 color=color.new(#00E676, 0), style=line.style_dashed, width=1)
+    tp2_line := line.new(bar_index, tp2,      bar_index + 5, tp2,
+                 color=color.new(#FFD740, 0), style=line.style_dashed, width=1)
+
+// ─────────────────────────────────────────────
+// ALERT CONDITIONS
+// ─────────────────────────────────────────────
+alertcondition(tier1_buy,
+     title="T1 HIGH CONVICTION BUY",
+     message="KLSE MSS | {{ticker}} | TIER 1 | Price={{close}} | High conviction swing setup")
+
+alertcondition(tier2_buy,
+     title="T2 MOMENTUM BUY",
+     message="KLSE MSS | {{ticker}} | TIER 2 | Price={{close}} | Momentum buy setup")
+
+alertcondition(tier3_watch,
+     title="WATCHLIST PRE-BREAKOUT",
+     message="KLSE MSS | {{ticker}} | WATCHLIST | Price={{close}} | BB squeeze forming")
+
+alertcondition(exit_signal,
+     title="EXIT SIGNAL",
+     message="KLSE MSS | {{ticker}} | EXIT | Price={{close}} | Momentum weakening")
+
+// ─────────────────────────────────────────────
+// HIDDEN PLOTS (for future screener use)
+// ─────────────────────────────────────────────
+plot(score,             title="Score 0-10",  display=display.none)
+plot(rsi,               title="RSI Value",   display=display.none)
+plot(adx,               title="ADX Value",   display=display.none)
+plot(tier1_buy ? 1 : 0, title="Tier1 Signal",display=display.none)
+plot(tier2_buy ? 1 : 0, title="Tier2 Signal",display=display.none)
+plot(vol_surge ? 1 : 0, title="Vol Surge",   display=display.none)
+
+// ============================================================
+// END OF SCRIPT
+// ============================================================
