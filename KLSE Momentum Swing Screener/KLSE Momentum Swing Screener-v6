@@ -19,6 +19,7 @@
 //            [v6-2]  Tranche exit labels — SELL 1/3 plotted at TP1 and TP2 hits
 //            [v6-3]  Trailing stop after TP1 hit — trails below EMA 20 or EMA 50
 //            [v6-4]  Hammer candlestick added to scoring (0-13 system)
+//            [v6-5]  VCP COIL alert — fires at tightest squeeze before breakout surge
 // ============================================================
 indicator("V6 KLSE Momentum Swing Screener", shorttitle="KLSE MSS v6", overlay=true, max_lines_count=20, max_labels_count=100)
 
@@ -67,6 +68,15 @@ stop_mode    = input.string("Momentum (EMA 20)", "Stop Mode", options=["Momentum
   tooltip="Momentum trades: cut below EMA 20. Strong fundamental holds: cut only below EMA 200 (daily).")
 trail_buffer = input.float(1.0, "Trail Buffer Below EMA (%)", minval=0.1, maxval=3.0, step=0.1, group=g_exit,
   tooltip="After TP1 hit, trailing stop sits this % below the chosen stop EMA.")
+
+// [v6-5] VCP COIL settings
+g_coil = "VCP COIL — Pre-Breakout Early Alert"
+coil_vol_bars  = input.int(20,   "Volume Dry-Up Lookback (days)",  minval=5, maxval=60, group=g_coil,
+  tooltip="COIL fires when today's volume is the lowest in this many trading days — supply has dried up completely.")
+coil_bb_pct    = input.int(10,   "BB Tightness Percentile (0-25)", minval=1, maxval=25, group=g_coil,
+  tooltip="COIL requires BB width in the bottom N% of its 125-day range — price is at its tightest coil.")
+coil_mcdx_gate = input.bool(true, "Require MCDX Bullish for COIL", group=g_coil,
+  tooltip="Only alert if smart money (MCDX) is still positive — filters coils where institutions have already left.")
 
 // [v6-4] Hammer settings
 g_hammer = "Hammer Pattern"
@@ -204,6 +214,19 @@ bb_width    = (bb_upper - bb_lower) / bb_basis * 100
 bb_squeeze  = bb_width < ta.percentile_linear_interpolation(bb_width, 125, 20)
 bb_mid_bull = close > bb_basis
 
+// [v6-5] VCP COIL DETECTION
+// The tightest squeeze point fires BEFORE the volume surge.
+// Logic: BB at its absolute narrowest (bottom coil_bb_pct percentile)
+//        AND volume at N-day low (supply completely dried up)
+//        AND trend is intact (stock above EMA 50 + EMA 200)
+//        AND MCDX bullish (smart money still present, optional gate)
+// This combination signals the spring is wound to maximum — breakout imminent.
+bb_at_tightest = bb_width < ta.percentile_linear_interpolation(bb_width, 125, coil_bb_pct)
+vol_at_nday_low = volume <= ta.lowest(volume, coil_vol_bars)
+coil_mcdx_ok   = coil_mcdx_gate ? mcdxBull : true
+coil_signal    = gate and bull_trend and bb_at_tightest and vol_at_nday_low and coil_mcdx_ok
+new_coil       = coil_signal and not coil_signal[1]
+
 // ============================================================
 // ATR
 // ============================================================
@@ -270,6 +293,7 @@ tier3_watch = gate and score >= 7  and (bb_squeeze or stoch_cross_up) and bull_t
 new_t1 = tier1_buy   and not tier1_buy[1]
 new_t2 = tier2_buy   and not tier2_buy[1]
 new_t3 = tier3_watch and not tier3_watch[1]
+// new_coil already defined above (fires before T3)
 
 // ============================================================
 // EXIT CONDITIONS
@@ -339,6 +363,10 @@ if exit_signal or hard_stop_hit or (not na(sl_locked) and close < sl_locked) or 
 // ============================================================
 // VISUAL SIGNALS
 // ============================================================
+// [v6-5] COIL — earliest signal, fires before any tier buy
+plotshape(new_coil, title="VCP COIL", style=shape.circle, location=location.belowbar, color=color.new(#7B1FA2, 0), textcolor=color.white, size=size.small)
+bgcolor(coil_signal and not tier1_buy and not tier2_buy ? color.new(#4A148C, 95) : na, title="COIL Background")
+
 plotshape(new_t1,   title="T1 BUY", style=shape.labelup,    location=location.belowbar, color=color.new(#00E676, 0),  textcolor=color.white, text="T1",   size=size.normal)
 plotshape(new_t2,   title="T2 BUY", style=shape.triangleup, location=location.belowbar, color=color.new(#69F0AE, 10), textcolor=color.white,              size=size.small)
 plotshape(new_t3,   title="WATCH",  style=shape.diamond,    location=location.belowbar, color=color.new(#FFD740, 20), textcolor=color.white,              size=size.tiny)
@@ -444,8 +472,8 @@ if show_dash and (barstate.islast or barstate.isrealtime)
     table.cell(dash, 1, r_stop, stop_mode_short, bgcolor=hard_stop_hit ? c_no : c_dark, text_color=hard_stop_hit ? c_bad : c_amber, text_size=size.small, text_halign=text.align_center)
 
     // Trade state
-    state_lbl = tp1_hit ? "TP1 HIT — TRAIL" : tier1_buy ? "T1  HIGH CONVICTION" : tier2_buy ? "T2  MOMENTUM BUY" : tier3_watch ? "WATCHLIST" : exit_signal ? "EXIT  --  AVOID" : "NEUTRAL"
-    state_col = tp1_hit ? c_amber : tier1_buy ? c_good : tier2_buy ? c_mid : tier3_watch ? c_warn : exit_signal ? c_bad : c_gray
+    state_lbl = tp1_hit ? "TP1 HIT — TRAIL" : tier1_buy ? "T1  HIGH CONVICTION" : tier2_buy ? "T2  MOMENTUM BUY" : tier3_watch ? "WATCHLIST" : coil_signal ? "VCP COIL — PREPARE" : exit_signal ? "EXIT  --  AVOID" : "NEUTRAL"
+    state_col = tp1_hit ? c_amber : tier1_buy ? c_good : tier2_buy ? c_mid : tier3_watch ? c_warn : coil_signal ? c_purp : exit_signal ? c_bad : c_gray
     f_cell(0, r_sig, "SIGNAL",   c_bg,   c_gray)
     f_cell(1, r_sig, state_lbl, state_col, c_white)
 
@@ -459,6 +487,7 @@ if show_dash and (barstate.islast or barstate.isrealtime)
 // ============================================================
 // ALERTS
 // ============================================================
+alertcondition(new_coil, title="VCP COIL — Prepare Entry", message="KLSE MSS v6 | {{ticker}} | VCP COIL: BB at tightest + volume at {{volume}}-day low. Spring wound. Breakout likely within 1-5 days.")
 alertcondition(new_t1,   title="T1 HIGH CONVICTION BUY",  message="KLSE MSS v6 | {{ticker}} | TIER 1 | Price={{close}} | Score>=11")
 alertcondition(new_t2,   title="T2 MOMENTUM BUY",         message="KLSE MSS v6 | {{ticker}} | TIER 2 | Price={{close}} | Score>=9")
 alertcondition(new_t3,   title="WATCHLIST PRE-BREAKOUT",  message="KLSE MSS v6 | {{ticker}} | WATCHLIST | Price={{close}} | Score>=7")
