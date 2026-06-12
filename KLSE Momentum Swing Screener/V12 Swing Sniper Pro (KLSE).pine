@@ -23,6 +23,11 @@
 //     options; stops wider than the max-stop % cap block the BUY
 //   - Stop / target / pivot levels drawn on the chart; table is compact
 //     by default (toggle "show gate detail rows" for full diagnostics)
+// Patch 2026-06-12 (post-promotion):
+//   - Min-tick stop check and net R:R floor are now HARD gates in the BUY
+//     signal and verdict (were display-only). Restores V10's cost
+//     discipline: no BUY when the stop is untradeable or net R:R < 2.
+//   - Notional cap default 10% per KLSE_MASTER_SYSTEM section 6.
 // Notes: every table.cell on its own line; no multi-line ternaries.
 // =====================================================================
 indicator("V12 Swing Sniper Pro", shorttitle = "V12 Sniper", overlay = true, calc_bars_count = 500)
@@ -77,6 +82,7 @@ maxAtrTgt  = input.float(10.0,    "Max ATRs to target (feasibility)", group = gr
 requireFeas= input.bool(true,     "BUY requires feasible target",     group = grpRisk)
 minValRM   = input.float(500000.0,"Min avg traded value RM/day (20-bar)", group = grpRisk)
 minTicks   = input.float(8.0,     "Min stop distance (Bursa ticks)",  group = grpRisk)
+minNetRR   = input.float(2.0,     "Min net R:R (hard gate)",          group = grpRisk, tooltip = "Master System rule: net reward:risk after costs must be >= 2:1. Blocks BUY when the stop is so tight that round-trip costs destroy the R math (e.g. price sitting exactly on the EMA20 stop reference).")
 
 grpUx      = "Display"
 showMAs    = input.bool(true, "Plot moving averages", group = grpUx)
@@ -322,10 +328,14 @@ tgtFeasible = atrsToTgt <= maxAtrTgt and (blueSky or headroomR >= grossRNeeded)
 // ---------------------------- SIGNALS ----------------------------
 // V12 fix: BUY now respects feasibility (optional), liquidity and the
 // macro gate - V11 fired the alert even when the verdict said WATCH.
+// Patch 2026-06-12: tick-size stop sanity and net R:R floor promoted from
+// display-only to HARD gates - a stop 1-2 ticks away (price sitting on the
+// EMA20 reference) produced untradeable risk math that still showed BUY.
 feasOK = not requireFeas or tgtFeasible
+rrOK   = netRR >= minNetRR
 
-swingBuySignal = trendOK and entryTimingOK and breakout and feasOK and liqOK and stopOK and not macroBlock
-trendBuySignal = trendOK and pullback50 and feasOK and liqOK and stopOK and not macroBlock
+swingBuySignal = trendOK and entryTimingOK and breakout and feasOK and liqOK and stopOK and ticksOK and rrOK and not macroBlock
+trendBuySignal = trendOK and pullback50 and feasOK and liqOK and stopOK and ticksOK and rrOK and not macroBlock
 buySignal      = tradeMode == "Swing" ? swingBuySignal : trendBuySignal
 
 // ---------------------------- VERDICT ----------------------------
@@ -355,6 +365,12 @@ else if tradeMode == "Swing" and not breakout
 else if tradeMode == "Trend" and not pullback50
     verdict    := "HOLD ZONE - await 50-SMA pullback"
     verdictCol := color.yellow
+else if not ticksOK
+    verdict    := "WATCH - stop too tight (" + str.tostring(stopTicks, "#.#") + " ticks, min " + str.tostring(minTicks, "#") + ")"
+    verdictCol := color.orange
+else if not rrOK
+    verdict    := "SKIP - net R:R " + str.tostring(netRR, "#.##") + " below " + str.tostring(minNetRR, "#.#")
+    verdictCol := color.orange
 else if requireFeas and not tgtFeasible
     verdict    := "WATCH - target infeasible"
     verdictCol := color.orange
@@ -507,7 +523,7 @@ if barstate.islast
     table.cell(t, 1, r, "RM " + str.tostring(valueSma / 1000, "#") + "k/day", text_color = f_col(liqOK), bgcolor = colPanel, text_size = size.small)
     r += 1
     table.cell(t, 0, r, "Net R:R @ " + str.tostring(targetR, "#.#") + "R", text_color = colLbl, bgcolor = colPanel, text_size = size.small)
-    table.cell(t, 1, r, "1 : " + str.tostring(netRR, "#.##"), text_color = netRR >= 2.0 ? color.lime : color.red, bgcolor = colPanel, text_size = size.small)
+    table.cell(t, 1, r, "1 : " + str.tostring(netRR, "#.##"), text_color = netRR >= minNetRR ? color.lime : color.red, bgcolor = colPanel, text_size = size.small)
     r += 1
     table.cell(t, 0, r, "Target @ " + str.tostring(targetR, "#.#") + "R", text_color = colLbl, bgcolor = colPanel, text_size = size.small)
     table.cell(t, 1, r, "RM " + str.tostring(targetPx, "#.###") + " (" + str.tostring(atrsToTgt, "#.#") + " ATR)", text_color = colLbl, bgcolor = colPanel, text_size = size.small)
