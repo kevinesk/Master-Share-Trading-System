@@ -1,0 +1,258 @@
+//@version=5
+// ================================================================
+// KLSE Ex-Dividend Alert — v2
+// Exchange : Bursa Malaysia (KLSE)
+// Timeframe: Daily (required)
+//
+// Changes vs v1:
+//  [v1-fix] gaps=barmerge.gaps_on — v1 returned div value on every bar
+//  [v2-1]   Calendar-day timestamps replace bar-count intervals — more accurate
+//  [v2-2]   Track last 4 ex-dates, weighted average — smoother estimate
+//  [v2-3]   Overdue tolerance — shows "DUE SOON / Check Bursa" for N calendar
+//           days after estimate passes (companies often pay ±weeks off schedule)
+//  [v2-4]   Estimated ex-date shown as formatted calendar date (dd MMM yyyy)
+//  [v2-5]   Interval History row shows last 3 measured gaps for transparency
+//
+// Signal sequence:
+//   Purple diamond  → past ex-date marker
+//   Yellow glow     → buy window open, quality gates not yet passing
+//   Green glow      → buy window open + all gates pass — act now
+//   Blue glow       → estimate passed but actual ex-date not yet seen (DUE SOON)
+//   Green BUY-DIV   → first bar of buy window with all gates passing
+//   Blue EX-DATE    → today is the confirmed ex-date (buy before open)
+// ================================================================
+indicator("KLSE Ex-Dividend Alert v2", shorttitle="ExDiv v2", overlay=true, max_labels_count=100)
+
+// ================================================================
+// INPUTS
+// ================================================================
+g1 = "Ex-Dividend Settings"
+alert_days  = input.int(14,   "Alert Window (calendar days before ex-date)", minval=5,  maxval=45, group=g1,
+  tooltip="BUY-DIV fires this many calendar days before the estimated ex-date. 14 = 2 weeks.")
+overdue_tol = input.int(45,   "Overdue Tolerance (calendar days)",           minval=14, maxval=90, group=g1,
+  tooltip="After the estimate date passes, stay in DUE SOON state for this many days before giving up. Companies often pay a few weeks later than the average pattern suggests.")
+min_yield   = input.float(2.0, "Minimum Dividend Yield (%)", minval=0.5, maxval=15.0, step=0.5, group=g1,
+  tooltip="Only alert when estimated annual yield meets this threshold.")
+use_gross   = input.bool(true, "Use Gross Dividend (vs Net)", group=g1,
+  tooltip="Gross = before withholding tax. KLSE dividends are typically quoted gross.")
+
+g2 = "Quality Filter"
+use_tech_filter = input.bool(true,    "Require Bullish Technical Setup", group=g2,
+  tooltip="Only alert when price is above EMA 50 and RSI < 75.")
+min_price = input.float(0.50, "Min Price (RM)",          group=g2)
+min_vol   = input.int(200000, "Min Avg Volume (shares)", group=g2)
+
+g3 = "Display"
+show_dash      = input.bool(true, "Show Dashboard",               group=g3)
+show_past_divs = input.bool(true, "Mark Past Ex-Dates on Chart",  group=g3)
+show_ema       = input.bool(true, "Show EMA 50 and EMA 200",      group=g3)
+
+// ================================================================
+// DIVIDEND DATA — gaps_on ensures data only appears on actual ex-date bars
+// ================================================================
+div_field = use_gross ? dividends.gross : dividends.net
+div_raw   = request.dividends(syminfo.tickerid, div_field, gaps=barmerge.gaps_on)
+
+// Track timestamps (ms) and amounts of the last 4 ex-dates
+var int   ts1 = na    // most recent ex-date timestamp
+var int   ts2 = na
+var int   ts3 = na
+var int   ts4 = na
+var float amt1 = na   // most recent dividend per share
+var float amt2 = na   // second most recent (for display)
+
+if not na(div_raw)
+    ts4  := ts3
+    ts3  := ts2
+    ts2  := ts1
+    ts1  := time          // Pine Script `time` is int (ms since epoch)
+    amt2 := amt1
+    amt1 := div_raw
+
+// ================================================================
+// INTERVAL CALCULATION — calendar days between consecutive ex-dates
+// ================================================================
+MS_DAY = 86400000   // milliseconds per calendar day
+
+// Three most recent intervals in calendar days
+gap1 = not na(ts1) and not na(ts2) ? int(math.round((ts1 - ts2) / MS_DAY)) : na
+gap2 = not na(ts2) and not na(ts3) ? int(math.round((ts2 - ts3) / MS_DAY)) : na
+gap3 = not na(ts3) and not na(ts4) ? int(math.round((ts3 - ts4) / MS_DAY)) : na
+
+// Weighted average: recent gaps carry more weight (3-2-1 weighting)
+avg_gap = not na(gap3) ? int(math.round((gap1 * 3 + gap2 * 2 + gap3) / 6.0)) :
+          not na(gap2)  ? int(math.round((gap1 * 2 + gap2)       / 3.0)) :
+          gap1
+
+// Estimated next ex-date timestamp and payments per year
+pay_per_yr  = not na(avg_gap) and avg_gap > 0 ? math.max(1, math.round(365.0 / avg_gap)) : 4
+est_next_ts = not na(ts1) and not na(avg_gap) ? ts1 + avg_gap * MS_DAY : na
+
+// Calendar days remaining to estimated ex-date
+// Positive = upcoming, 0 = today, negative = estimate already passed
+days_to_next = not na(est_next_ts) ? int(math.round((est_next_ts - time) / MS_DAY)) : na
+
+// ================================================================
+// STATE FLAGS
+// ================================================================
+ex_date_today = not na(div_raw)                                                             // confirmed by TV data
+in_buy_window = not na(days_to_next) and days_to_next > 0 and days_to_next <= alert_days   // estimate upcoming + within window
+due_soon      = not na(days_to_next) and days_to_next <= 0 and days_to_next > -overdue_tol // estimate passed but within tolerance
+new_in_window = in_buy_window and not in_buy_window[1]                                      // edge trigger
+
+// ================================================================
+// DIVIDEND YIELD
+// ================================================================
+annual_div = not na(amt1) ? amt1 * pay_per_yr : na
+div_yield  = not na(annual_div) and close > 0 ? (annual_div / close) * 100 : na
+yield_ok   = not na(div_yield) and div_yield >= min_yield
+
+// ================================================================
+// LIQUIDITY & TECHNICAL GATES
+// ================================================================
+avgVol      = ta.sma(volume, 20)
+liquidityOk = close >= min_price and avgVol >= min_vol
+
+ema50      = ta.ema(close, 50)
+ema200     = ta.ema(close, 200)
+rsi        = ta.rsi(close, 14)
+bull_trend = close > ema50
+not_ob     = rsi < 75
+tech_ok    = use_tech_filter ? (bull_trend and not_ob) : true
+all_gates  = liquidityOk and yield_ok and tech_ok
+
+// ================================================================
+// SIGNALS
+// ================================================================
+buy_signal = new_in_window and all_gates
+
+// ================================================================
+// VISUALS
+// ================================================================
+plotshape(show_past_divs and ex_date_today, title="Past Ex-Date",
+  style=shape.diamond, location=location.belowbar, color=color.new(#7B1FA2, 0), size=size.small)
+
+bgcolor(in_buy_window and all_gates     ? color.new(#00E676, 92) : na, title="Buy Window — Gates Pass")
+bgcolor(in_buy_window and not all_gates ? color.new(#FFD740, 95) : na, title="Buy Window — Gates Fail")
+bgcolor(due_soon                        ? color.new(#2196F3, 97) : na, title="Due Soon — Check Bursa")
+
+plotshape(buy_signal, title="BUY-DIV Signal",
+  style=shape.labelup, location=location.belowbar,
+  color=color.new(#00E676, 0), text="BUY-DIV", textcolor=color.black, size=size.normal)
+
+plotshape(ex_date_today, title="Ex-Date Today",
+  style=shape.labelup, location=location.abovebar,
+  color=color.new(#2196F3, 0), text="EX-DATE", textcolor=color.white, size=size.small)
+
+plot(show_ema ? ema50  : na, title="EMA 50",  color=color.new(#FF9800, 30), linewidth=1)
+plot(show_ema ? ema200 : na, title="EMA 200", color=color.new(#FF5252, 30), linewidth=2)
+
+// ================================================================
+// DASHBOARD
+// ================================================================
+c_good  = color.new(#00E676, 0)
+c_bad   = color.new(#FF5252, 0)
+c_warn  = color.new(#FFD740, 0)
+c_gray  = color.new(#8B949E, 0)
+c_blue  = color.new(#58A6FF, 0)
+c_hdr   = color.new(#1F2937, 0)
+c_bg    = color.new(#0D1117, 0)
+c_dark  = color.new(#161B22, 0)
+c_white = color.new(#FFFFFF, 0)
+
+var table dash = table.new(position.top_right, 2, 11,
+  bgcolor=c_bg, border_color=color.new(#30363D, 0), border_width=1,
+  frame_color=c_blue, frame_width=2)
+
+if show_dash and (barstate.islast or barstate.isrealtime)
+    table.cell(dash, 0, 0, "KLSE EX-DIV ALERT v2", bgcolor=c_hdr, text_color=c_blue, text_size=size.small, text_halign=text.align_left)
+    table.cell(dash, 1, 0, "Status",                bgcolor=c_hdr, text_color=c_blue, text_size=size.small)
+
+    // Last two dividend amounts
+    div_str  = not na(amt1) ? "RM " + str.tostring(amt1, "#.####") : "No data"
+    prev_str = not na(amt2) ? "  (prev RM " + str.tostring(amt2, "#.####") + ")" : ""
+    table.cell(dash, 0, 1, "Last Dividend",    bgcolor=c_dark, text_color=c_gray,  text_size=size.small, text_halign=text.align_left)
+    table.cell(dash, 1, 1, div_str + prev_str, bgcolor=c_dark, text_color=c_white, text_size=size.small)
+
+    // Payment frequency
+    freq_str = not na(avg_gap) ? str.tostring(pay_per_yr) + "x/yr  (avg " + str.tostring(avg_gap) + " cal days)" : "Need >= 2 records"
+    freq_col = not na(avg_gap) ? c_white : c_warn
+    table.cell(dash, 0, 2, "Pay Frequency",  bgcolor=c_dark, text_color=c_gray, text_size=size.small, text_halign=text.align_left)
+    table.cell(dash, 1, 2, freq_str,         bgcolor=c_dark, text_color=freq_col, text_size=size.small)
+
+    // Annual yield
+    yield_str = not na(div_yield) ? str.tostring(math.round(div_yield, 2)) + "%" : "--"
+    yield_col = not na(div_yield) ? (div_yield >= min_yield ? c_good : c_bad) : c_gray
+    table.cell(dash, 0, 3, "Est. Annual Yield",  bgcolor=c_dark, text_color=c_gray,   text_size=size.small, text_halign=text.align_left)
+    table.cell(dash, 1, 3, yield_str,            bgcolor=c_dark, text_color=yield_col, text_size=size.small)
+
+    // Estimated next ex-date — formatted calendar date + days label
+    date_str   = not na(est_next_ts) ? str.format_time(est_next_ts, "dd MMM yyyy", syminfo.timezone) : "--"
+    days_label = not na(days_to_next) ?
+      (days_to_next > 0  ? "  (" + str.tostring(days_to_next) + " days)" :
+       days_to_next == 0 ? "  (TODAY)" :
+                           "  (" + str.tostring(-days_to_next) + "d past est.)") : ""
+    est_col = in_buy_window ? c_warn : due_soon ? c_blue : c_gray
+    table.cell(dash, 0, 4, "Est. Next Ex-Date",      bgcolor=c_dark, text_color=c_gray, text_size=size.small, text_halign=text.align_left)
+    table.cell(dash, 1, 4, date_str + days_label,    bgcolor=c_dark, text_color=est_col, text_size=size.small)
+
+    // Interval history — last 3 gaps for transparency
+    h1 = not na(gap1) ? str.tostring(gap1) + "d" : "--"
+    h2 = not na(gap2) ? " / " + str.tostring(gap2) + "d" : ""
+    h3 = not na(gap3) ? " / " + str.tostring(gap3) + "d" : ""
+    table.cell(dash, 0, 5, "Interval History",  bgcolor=c_dark, text_color=c_gray, text_size=size.small, text_halign=text.align_left)
+    table.cell(dash, 1, 5, h1 + h2 + h3,       bgcolor=c_dark, text_color=c_gray, text_size=size.tiny)
+
+    // Technical filter
+    tf_why = not bull_trend ? "Below EMA 50" : "RSI overbought"
+    tf_str = use_tech_filter ? (tech_ok ? "PASS" : "FAIL — " + tf_why) : "Disabled"
+    table.cell(dash, 0, 6, "Tech Filter",  bgcolor=c_dark, text_color=c_gray, text_size=size.small, text_halign=text.align_left)
+    table.cell(dash, 1, 6, tf_str,         bgcolor=c_dark, text_color=use_tech_filter ? (tech_ok ? c_good : c_bad) : c_gray, text_size=size.small)
+
+    // Liquidity
+    liq_fail = close < min_price ? "Price < RM" + str.tostring(min_price) : "Vol too low"
+    liq_str  = liquidityOk ? "PASS" : "FAIL — " + liq_fail
+    table.cell(dash, 0, 7, "Liquidity Gate",  bgcolor=c_dark, text_color=c_gray, text_size=size.small, text_halign=text.align_left)
+    table.cell(dash, 1, 7, liq_str,           bgcolor=c_dark, text_color=liquidityOk ? c_good : c_bad, text_size=size.small)
+
+    // Data coverage
+    no_data  = na(ts1)
+    n_recs   = not na(ts4) ? "4" : not na(ts3) ? "3" : not na(ts2) ? "2" : not na(ts1) ? "1" : "0"
+    data_str = no_data ? "No data — check Bursa" : not na(ts2) ? "Good (" + n_recs + " records)" : "Limited (1 record only)"
+    data_col = no_data ? c_bad : not na(ts2) ? c_good : c_warn
+    table.cell(dash, 0, 8, "TV Data Coverage",  bgcolor=c_dark, text_color=c_gray, text_size=size.small, text_halign=text.align_left)
+    table.cell(dash, 1, 8, data_str,            bgcolor=c_dark, text_color=data_col, text_size=size.small)
+
+    // Overall signal
+    sig_str = buy_signal                       ? "► BUY WINDOW OPEN" :
+              in_buy_window and not all_gates  ? "WINDOW — GATES FAIL" :
+              due_soon                         ? "DUE SOON — Check Bursa" :
+              ex_date_today                    ? "EX-DATE TODAY" :
+              not na(days_to_next) and days_to_next > 0 ? "WAIT  " + str.tostring(days_to_next) + " days" :
+              "MONITORING"
+    sig_col = buy_signal ? c_good : in_buy_window ? c_warn : due_soon ? c_blue : ex_date_today ? c_blue : c_gray
+    table.cell(dash, 0, 9, "SIGNAL",  bgcolor=c_bg, text_color=c_gray,  text_size=size.small, text_halign=text.align_left)
+    table.cell(dash, 1, 9, sig_str,   bgcolor=c_bg, text_color=sig_col, text_size=size.small)
+
+    // Disclaimer
+    table.cell(dash, 0, 10, "Estimate = avg interval from history",  bgcolor=c_bg, text_color=color.new(#8B949E, 50), text_size=size.tiny, text_halign=text.align_left)
+    table.cell(dash, 1, 10, "Verify at bursamalaysia.com",           bgcolor=c_bg, text_color=color.new(#8B949E, 50), text_size=size.tiny)
+
+// ================================================================
+// ALERTS
+// ================================================================
+alertcondition(buy_signal,
+  title="Ex-Div Buy Window Opens",
+  message="ExDiv | {{ticker}} | BUY WINDOW OPEN — estimated ex-date approaching. Check dashboard for date and yield. Price: {{close}}")
+
+alertcondition(due_soon and not due_soon[1],
+  title="Ex-Div Due Soon — Check Bursa",
+  message="ExDiv | {{ticker}} | Estimated ex-date has passed but not yet confirmed. Check bursamalaysia.com for announcement. Price: {{close}}")
+
+alertcondition(ex_date_today,
+  title="Ex-Dividend Date Today",
+  message="ExDiv | {{ticker}} | EX-DATE TODAY. Buy BEFORE market open to capture dividend. Price: {{close}}")
+
+// ================================================================
+// END OF SCRIPT
+// ================================================================

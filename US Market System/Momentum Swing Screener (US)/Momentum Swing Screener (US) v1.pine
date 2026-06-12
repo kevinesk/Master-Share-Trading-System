@@ -1,0 +1,496 @@
+//@version=5
+// ============================================================
+// US Momentum Swing Screener  v1
+// Exchange : US (NYSE / NASDAQ) — equity ETFs/stocks only
+// Timeframe: Daily (primary) | 4H / 1H (confluence)
+// US sibling of "KLSE Momentum Swing Screener v6". Same 0-13
+// scoring engine, tiered signals, locked SL/TP, tranche exits,
+// dashboard, and hidden plots for the Pine Screener.
+//
+// DATA CONSTRAINT (Kevin's plan = free delayed US equity data):
+//   - True RS benchmark uses AMEX:SPY (equity ETF) — index symbols
+//     (SPX/NDX/VIX) need a paid plan and would error.
+//   - Only one external symbol is pulled (the benchmark); everything
+//     else is the chart symbol. Run on a US stock, Daily timeframe.
+//
+// CHANGES vs KLSE v6:
+//   [us-1] Benchmark MYX:FBMKLCI -> AMEX:SPY (True RS vs S&P 500)
+//   [us-2] Liquidity in USD: min price + min avg volume + min $-volume
+//   [us-3] Labels / alerts / dashboard relabelled US
+//   [us-4] Single shares (no board-lot rounding) — sizing is done in
+//          Pro Quant Desk (US); this screener focuses on setup quality
+// ============================================================
+indicator("US Momentum Swing Screener", shorttitle="US MSS v1", overlay=true, max_lines_count=20, max_labels_count=100)
+
+// ============================================================
+// INPUTS
+// ============================================================
+g1 = "Trend Filter - EMA Ribbon"
+ema9_len   = input.int(9,   "Fast EMA",   minval=1, group=g1)
+ema21_len  = input.int(21,  "Mid EMA",    minval=1, group=g1)
+ema50_len  = input.int(50,  "Slow EMA",   minval=1, group=g1)
+ema200_len = input.int(200, "Anchor EMA", minval=1, group=g1)
+
+g2 = "Momentum - RSI and StochRSI"
+rsi_len     = input.int(14, "RSI Period",        group=g2)
+rsi_low     = input.int(50, "RSI Bullish Floor", group=g2)
+rsi_high    = input.int(75, "RSI Ceiling OB",    group=g2)
+stoch_k_len = input.int(3,  "Stoch K Smooth",    group=g2)
+stoch_d_len = input.int(3,  "Stoch D Smooth",    group=g2)
+stoch_rsi_l = input.int(14, "StochRSI Length",   group=g2)
+
+g3 = "MACD Confluence"
+macd_fast = input.int(12, "MACD Fast", group=g3)
+macd_slow = input.int(26, "MACD Slow", group=g3)
+macd_sig  = input.int(9,  "Signal",    group=g3)
+
+g4 = "Volume Analysis"
+vol_ma_len  = input.int(20,    "Volume MA Period",        group=g4)
+vol_surge_x = input.float(1.5, "Volume Surge Multiplier", group=g4, step=0.1)
+
+g5 = "ADX Trend Strength"
+adx_len       = input.int(14, "ADX Length",       group=g5)
+adx_threshold = input.int(20, "ADX Min Strength", group=g5)
+
+g6 = "Bollinger Band"
+bb_len  = input.int(20,    "BB Period", group=g6)
+bb_mult = input.float(2.0, "BB StdDev", group=g6)
+
+g7 = "Risk Management ATR"
+atr_len     = input.int(14,    "ATR Period",          group=g7)
+atr_sl_mult = input.float(1.5, "Stop-Loss ATR x",     group=g7)
+atr_tp_mult = input.float(2.5, "Take-Profit ATR x",   group=g7)
+
+g_exit = "Exit Management"
+stop_mode    = input.string("Momentum (EMA 20)", "Stop Mode", options=["Momentum (EMA 20)", "Fundamental (EMA 200)"], group=g_exit,
+  tooltip="Momentum trades: cut below EMA 20. Strong fundamental holds: cut only below EMA 200 (daily).")
+trail_buffer = input.float(1.0, "Trail Buffer Below EMA (%)", minval=0.1, maxval=3.0, step=0.1, group=g_exit,
+  tooltip="After TP1 hit, trailing stop sits this % below the chosen stop EMA.")
+
+g_coil = "VCP COIL — Pre-Breakout Early Alert"
+coil_vol_bars  = input.int(20,   "Volume Dry-Up Lookback (days)",  minval=5, maxval=60, group=g_coil,
+  tooltip="COIL fires when today's volume is the lowest in this many trading days — supply has dried up.")
+coil_bb_pct    = input.int(10,   "BB Tightness Percentile (0-25)", minval=1, maxval=25, group=g_coil,
+  tooltip="COIL requires BB width in the bottom N% of its 125-day range — price at its tightest coil.")
+coil_mcdx_gate = input.bool(true, "Require MCDX Bullish for COIL", group=g_coil,
+  tooltip="Only alert if smart money (MCDX proxy) is still positive.")
+
+g_hammer = "Hammer Pattern"
+use_hammer       = input.bool(true, "Detect Hammer Candles (adds 1 score point)", group=g_hammer)
+hammer_wick_mult = input.float(2.0, "Min Lower Wick / Body Ratio", group=g_hammer, minval=1.0, step=0.1)
+hammer_upper_max = input.float(0.5, "Max Upper Wick / Body Ratio", group=g_hammer, minval=0.0, step=0.1)
+
+// [us-1] [us-2] US-specific filters
+g8 = "US Filters"
+idx           = input.symbol("AMEX:SPY", "Benchmark for True RS",            group=g8,
+  tooltip="AMEX:SPY (S&P 500 ETF). Equity feed works on free plans; the SPX index would need paid data. RS is scale-invariant so the ETF is equivalent.")
+use_rs        = input.bool(true,   "Enable True RS Filter vs SPY",           group=g8)
+min_price     = input.float(5.0,   "Min Price (USD)",                        group=g8,
+  tooltip="Minervini/IBD avoid thin sub-$5 names. Raise to 10-12 for higher quality.")
+min_vol       = input.int(500000,  "Min Avg Volume (shares)",                group=g8)
+min_dollar_vol= input.float(5.0,   "Min Avg $-Volume (millions/day)",        group=g8, step=0.5,
+  tooltip="Dollar volume = price x volume. The standard US liquidity gate. 5 = $5M/day floor.")
+exit_min      = input.int(3,       "Exit: min conditions required (1-4)",    group=g8, minval=1, maxval=4)
+
+g9 = "Display"
+show_dash      = input.bool(true,  "Show Dashboard",              group=g9)
+show_levels    = input.bool(true,  "Show Locked SL / TP Lines",   group=g9)
+show_daily_row = input.bool(true,  "Dashboard: Daily Anchor Row", group=g9)
+show_rs_row    = input.bool(true,  "Dashboard: True RS Row",      group=g9)
+show_liq_row   = input.bool(true,  "Dashboard: Liquidity Row",    group=g9)
+show_mcdx_row  = input.bool(true,  "Dashboard: MCDX Row",         group=g9)
+hudPosStr      = input.string("Top Right", "HUD Position", options=["Top Left","Top Center","Top Right","Bottom Left","Bottom Center","Bottom Right"], group=g9)
+
+// ============================================================
+// COLOURS
+// ============================================================
+c_good  = color.new(#00E676, 0)
+c_mid   = color.new(#69F0AE, 0)
+c_warn  = color.new(#FFD740, 0)
+c_bad   = color.new(#FF5252, 0)
+c_blue  = color.new(#58A6FF, 0)
+c_gray  = color.new(#8B949E, 0)
+c_white = color.new(#FFFFFF, 0)
+c_amber = color.new(#E3B341, 0)
+c_purp  = color.new(#CE93D8, 0)
+c_hdr   = color.new(#1F2937, 0)
+c_bg    = color.new(#0D1117, 0)
+c_dark  = color.new(#161B22, 0)
+c_yes   = color.new(#0D3320, 0)
+c_no    = color.new(#3D0C0C, 0)
+
+// ============================================================
+// [us-2] US LIQUIDITY GATE (price + share volume + dollar volume)
+// ============================================================
+avgVol       = ta.sma(volume, vol_ma_len)
+d_avg_vol    = request.security(syminfo.tickerid, "D", ta.sma(volume, vol_ma_len),       lookahead=barmerge.lookahead_off)
+d_avg_dollar = request.security(syminfo.tickerid, "D", ta.sma(close * volume, vol_ma_len), lookahead=barmerge.lookahead_off)
+liquidityOk  = close >= min_price and d_avg_vol >= min_vol and d_avg_dollar >= min_dollar_vol * 1000000
+
+// ============================================================
+// DAILY TREND ANCHOR
+// ============================================================
+f_daily_trend() =>
+    _e50  = ta.ema(close, 50)
+    _e150 = ta.ema(close, 150)
+    _e200 = ta.ema(close, 200)
+    not na(_e50) and not na(_e150) and not na(_e200) and close > _e200 and _e50 > _e150 and _e150 > _e200
+
+dailyTrend = request.security(syminfo.tickerid, "D", f_daily_trend(), lookahead=barmerge.lookahead_off)
+
+// Daily EMA values for stop mode
+daily_ema20  = request.security(syminfo.tickerid, "D", ta.ema(close, 20),  lookahead=barmerge.lookahead_off)
+daily_ema200 = request.security(syminfo.tickerid, "D", ta.ema(close, 200), lookahead=barmerge.lookahead_off)
+
+// ============================================================
+// [us-1] TRUE RELATIVE STRENGTH vs SPY
+// ============================================================
+idxClose = request.security(idx, timeframe.period, close, lookahead=barmerge.lookahead_off, ignore_invalid_symbol=true)
+trueRS   = not na(idxClose) and idxClose > 0 ? close / idxClose : na
+strongRS = not na(trueRS) and trueRS > ta.sma(trueRS, 50)
+rsPass   = use_rs ? strongRS : true
+
+// ============================================================
+// EMA RIBBON
+// ============================================================
+ema9   = ta.ema(close, ema9_len)
+ema21  = ta.ema(close, ema21_len)
+ema50  = ta.ema(close, ema50_len)
+ema200 = ta.ema(close, ema200_len)
+
+plot(ema9,   title="EMA Fast",   color=color.new(#00E5FF, 0),  linewidth=1)
+plot(ema21,  title="EMA Mid",    color=color.new(#FFEB3B, 0),  linewidth=1)
+plot(ema50,  title="EMA Slow",   color=color.new(#FF9800, 0),  linewidth=2)
+plot(ema200, title="EMA Anchor", color=color.new(#FF5252, 20), linewidth=2)
+
+bull_trend     = close > ema50 and close > ema200
+ema_cross_bull = ta.crossover(ema9, ema21)
+ema_aligned    = ema9 > ema21 and ema21 > ema50 and ema50 > ema200
+
+// ============================================================
+// RSI + STOCHRSI
+// ============================================================
+rsi       = ta.rsi(close, rsi_len)
+rsi_min   = ta.lowest(rsi, stoch_rsi_l)
+rsi_max   = ta.highest(rsi, stoch_rsi_l)
+stoch_rsi = (rsi - rsi_min) / math.max(rsi_max - rsi_min, 0.001) * 100
+k_stoch   = ta.sma(stoch_rsi, stoch_k_len)
+d_stoch   = ta.sma(k_stoch, stoch_d_len)
+
+rsi_bullish    = rsi >= rsi_low and rsi <= rsi_high
+stoch_cross_up = ta.crossover(k_stoch, d_stoch) and k_stoch < 80
+
+// ============================================================
+// MACD
+// ============================================================
+[macdLine, signalLine, histLine] = ta.macd(close, macd_fast, macd_slow, macd_sig)
+
+macd_bullish     = macdLine > signalLine
+macd_cross_up    = ta.crossover(macdLine, signalLine)
+macd_hist_rising = histLine > histLine[1]
+
+// ============================================================
+// VOLUME + OBV
+// ============================================================
+vol_surge    = volume > avgVol * vol_surge_x
+vol_obv      = ta.obv
+vol_obv_ema  = ta.ema(vol_obv, 20)
+vol_obv_bull = vol_obv > vol_obv_ema
+
+// ============================================================
+// ADX
+// ============================================================
+[diplus, diminus, adx_val] = ta.dmi(adx_len, adx_len)
+adx_valid  = adx_val >= adx_threshold
+di_bullish = diplus > diminus
+
+// ============================================================
+// BOLLINGER BAND
+// ============================================================
+bb_basis    = ta.sma(close, bb_len)
+bb_dev      = ta.stdev(close, bb_len)
+bb_upper    = bb_basis + bb_mult * bb_dev
+bb_lower    = bb_basis - bb_mult * bb_dev
+bb_width    = (bb_upper - bb_lower) / bb_basis * 100
+bb_squeeze  = bb_width < ta.percentile_linear_interpolation(bb_width, 125, 20)
+bb_mid_bull = close > bb_basis
+
+// ============================================================
+// ATR
+// ============================================================
+atr_val = ta.atr(atr_len)
+
+// ============================================================
+// MCDX SMART MONEY PROXY
+// ============================================================
+mcdx     = ((ta.rsi(close, 14) - 50) * 3) + ((ta.mfi(hlc3, 14) - 50) * 2)
+mcdxBull = mcdx > 0
+
+// ============================================================
+// VWAP
+// ============================================================
+vwapVal   = ta.vwap(hlc3)
+aboveVwap = close > vwapVal
+plot(vwapVal, title="VWAP", color=color.new(#00BCD4, 40), linewidth=1, style=plot.style_circles)
+
+// ============================================================
+// HAMMER CANDLESTICK DETECTION
+// ============================================================
+body       = math.abs(close - open)
+totalRange = high - low
+lowerWick  = math.min(open, close) - low
+upperWick  = high - math.max(open, close)
+isHammer   = use_hammer and totalRange > 0 and body > 0
+           and lowerWick >= body * hammer_wick_mult
+           and upperWick <= body * hammer_upper_max
+           and close >= open
+
+// ============================================================
+// SCORING ENGINE (0-13)
+// ============================================================
+score = 0
+score := score + (ema_aligned      ? 1 : 0)
+score := score + (bull_trend       ? 1 : 0)
+score := score + (rsi_bullish      ? 1 : 0)
+score := score + (macd_bullish     ? 1 : 0)
+score := score + (macd_hist_rising ? 1 : 0)
+score := score + (vol_surge        ? 1 : 0)
+score := score + (vol_obv_bull     ? 1 : 0)
+score := score + (adx_valid        ? 1 : 0)
+score := score + (di_bullish       ? 1 : 0)
+score := score + (bb_mid_bull      ? 1 : 0)
+score := score + (mcdxBull         ? 1 : 0)
+score := score + (strongRS         ? 1 : 0)
+score := score + (isHammer         ? 1 : 0)
+
+// ============================================================
+// HARD GATE
+// ============================================================
+gate = dailyTrend and liquidityOk and rsPass
+
+// ============================================================
+// VCP COIL DETECTION
+// ============================================================
+bb_at_tightest  = bb_width < ta.percentile_linear_interpolation(bb_width, 125, coil_bb_pct)
+vol_at_nday_low = volume <= ta.lowest(volume, coil_vol_bars)
+coil_mcdx_ok    = coil_mcdx_gate ? mcdxBull : true
+coil_signal     = gate and bull_trend and bb_at_tightest and vol_at_nday_low and coil_mcdx_ok
+new_coil        = coil_signal and not coil_signal[1]
+
+// ============================================================
+// SIGNAL GENERATION — tiered (13-pt system)
+// T1: 11/13 = 85%   T2: 9/13 = 69%   T3: 7/13 = 54%
+// ============================================================
+tier1_buy   = gate and score >= 11 and (ema_cross_bull or macd_cross_up or stoch_cross_up) and vol_surge and adx_valid and rsi_bullish and bull_trend
+tier2_buy   = gate and score >= 9  and macd_bullish and vol_surge and rsi_bullish and bull_trend and not tier1_buy
+tier3_watch = gate and score >= 7  and (bb_squeeze or stoch_cross_up) and bull_trend and not tier1_buy and not tier2_buy
+
+new_t1 = tier1_buy   and not tier1_buy[1]
+new_t2 = tier2_buy   and not tier2_buy[1]
+new_t3 = tier3_watch and not tier3_watch[1]
+
+// ============================================================
+// EXIT CONDITIONS
+// ============================================================
+exit_c1     = ta.crossunder(ema9, ema21) ? 1 : 0
+exit_c2     = rsi > 80 ? 1 : 0
+exit_c3     = macdLine < signalLine and macdLine[1] >= signalLine[1] ? 1 : 0
+exit_c4     = close < ema21 ? 1 : 0
+exit_score  = exit_c1 + exit_c2 + exit_c3 + exit_c4
+exit_raw    = exit_score >= exit_min
+exit_signal = exit_raw and exit_raw[1]
+new_exit    = exit_signal and not exit_signal[1]
+
+// Hard stop: close below stop EMA (daily anchored)
+stop_ema_val  = stop_mode == "Fundamental (EMA 200)" ? daily_ema200 : daily_ema20
+hard_stop_hit = not na(stop_ema_val) and close < stop_ema_val
+
+// ============================================================
+// LOCKED SL / TP + TRANCHE EXITS
+// ============================================================
+var float sl_locked  = na
+var float tp1_locked = na
+var float tp2_locked = na
+var bool  tp1_hit    = false
+var bool  tp2_hit    = false
+var float trail_stop = na
+
+trail_ema = stop_mode == "Fundamental (EMA 200)" ? ema50 : ema21
+
+if new_t1 or new_t2
+    sl_locked  := close - atr_val * atr_sl_mult
+    tp1_locked := close + atr_val * atr_tp_mult
+    tp2_locked := close + atr_val * atr_tp_mult * 1.6
+    tp1_hit    := false
+    tp2_hit    := false
+    trail_stop := na
+
+tp1_reached = not na(tp1_locked) and high >= tp1_locked and not tp1_hit
+if tp1_reached
+    tp1_hit    := true
+    tp1_locked := na
+    trail_stop := trail_ema * (1 - trail_buffer / 100)
+
+tp2_reached = not na(tp2_locked) and high >= tp2_locked and not tp2_hit
+if tp2_reached
+    tp2_hit    := true
+    tp2_locked := na
+
+if tp1_hit and not na(trail_stop)
+    trail_stop := math.max(trail_stop, trail_ema * (1 - trail_buffer / 100))
+
+trail_stop_hit = tp1_hit and not na(trail_stop) and close < trail_stop
+
+if exit_signal or hard_stop_hit or (not na(sl_locked) and close < sl_locked) or trail_stop_hit
+    sl_locked  := na
+    tp1_locked := na
+    tp2_locked := na
+    tp1_hit    := false
+    tp2_hit    := false
+    trail_stop := na
+
+// ============================================================
+// VISUAL SIGNALS
+// ============================================================
+plotshape(new_coil, title="VCP COIL", style=shape.circle, location=location.belowbar, color=color.new(#7B1FA2, 0), textcolor=color.white, size=size.small)
+bgcolor(coil_signal and not tier1_buy and not tier2_buy ? color.new(#4A148C, 95) : na, title="COIL Background")
+
+plotshape(new_t1,   title="T1 BUY", style=shape.labelup,    location=location.belowbar, color=color.new(#00E676, 0),  textcolor=color.white, text="T1",   size=size.normal)
+plotshape(new_t2,   title="T2 BUY", style=shape.triangleup, location=location.belowbar, color=color.new(#69F0AE, 10), textcolor=color.white,              size=size.small)
+plotshape(new_t3,   title="WATCH",  style=shape.diamond,    location=location.belowbar, color=color.new(#FFD740, 20), textcolor=color.white,              size=size.tiny)
+
+plotshape(tp1_reached, title="SELL 1/3 at TP1", style=shape.labeldown, location=location.abovebar, color=color.new(#FF9800, 0), textcolor=color.white, text="SELL 1/3", size=size.small)
+plotshape(tp2_reached, title="SELL 1/3 at TP2", style=shape.labeldown, location=location.abovebar, color=color.new(#FFD740, 0), textcolor=color.white, text="SELL 1/3", size=size.small)
+
+plotshape(new_exit or hard_stop_hit or trail_stop_hit, title="EXIT", style=shape.labeldown, location=location.abovebar, color=color.new(#FF5252, 10), textcolor=color.white, text="EXIT", size=size.small)
+
+plotshape(isHammer and not new_t1 and not new_t2, title="Hammer", style=shape.diamond, location=location.belowbar, color=color.new(#CE93D8, 20), size=size.tiny)
+
+bgcolor(tier1_buy   ? color.new(#00E676, 93) : na, title="T1 BG")
+bgcolor(tier2_buy   ? color.new(#69F0AE, 93) : na, title="T2 BG")
+bgcolor(exit_signal ? color.new(#FF5252, 93) : na, title="Exit BG")
+
+plot(show_levels and not na(stop_ema_val) ? stop_ema_val : na, title="Stop EMA (daily)", color=color.new(#FF5252, 40), linewidth=2, style=plot.style_line)
+plot(show_levels and not na(sl_locked)  ? sl_locked  : na, title="Stop Loss",     color=color.new(#FF5252, 0), linewidth=1, style=plot.style_linebr)
+plot(show_levels and not na(tp1_locked) ? tp1_locked : na, title="Take Profit 1", color=color.new(#00E676, 0), linewidth=1, style=plot.style_linebr)
+plot(show_levels and not na(tp2_locked) ? tp2_locked : na, title="Take Profit 2", color=color.new(#FFD740, 0), linewidth=1, style=plot.style_linebr)
+plot(show_levels and not na(trail_stop) ? trail_stop : na, title="Trail Stop",    color=color.new(#CE93D8, 0), linewidth=1, style=plot.style_linebr)
+
+// ============================================================
+// HUD — DYNAMIC ROW WIRING
+// ============================================================
+r_hdr    = 0
+r_score  = 1
+r_ema    = 2
+r_trend  = 3
+r_rsi    = 4
+r_macd   = 5
+r_vol    = 6
+r_adx    = 7
+r_bb     = 8
+r_hammer = 9
+r_daily  = 10
+r_rs     = r_daily + (show_daily_row ? 1 : 0)
+r_liq    = r_rs    + (show_rs_row    ? 1 : 0)
+r_mcdx   = r_liq   + (show_liq_row   ? 1 : 0)
+r_stop   = r_mcdx  + (show_mcdx_row  ? 1 : 0)
+r_sig    = r_stop  + 1
+r_risk   = r_sig   + 1
+hud_rows = r_risk  + 1
+
+hudPos = switch hudPosStr
+    "Top Left"      => position.top_left
+    "Top Center"    => position.top_center
+    "Top Right"     => position.top_right
+    "Bottom Left"   => position.bottom_left
+    "Bottom Center" => position.bottom_center
+    => position.bottom_right
+
+var table dash = table.new(hudPos, 2, hud_rows, bgcolor=c_bg, border_color=color.new(#30363D, 0), border_width=1, frame_color=c_blue, frame_width=2)
+
+f_cell(c, r, txt, bg, fg) =>
+    table.cell(dash, c, r, txt, bgcolor=bg, text_color=fg, text_size=size.small, text_halign=text.align_center)
+
+f_row(r, lbl, cond) =>
+    table.cell(dash, 0, r, lbl,                     bgcolor=c_dark, text_color=c_gray,                    text_size=size.small, text_halign=text.align_left)
+    table.cell(dash, 1, r, cond ? "[YES]" : "[NO]", bgcolor=cond ? c_yes : c_no, text_color=cond ? c_good : c_bad, text_size=size.small, text_halign=text.align_center)
+
+if show_dash and (barstate.islast or barstate.isrealtime)
+    f_cell(0, r_hdr, "US MSS v1  --  Swing Scorecard", c_hdr, c_blue)
+    f_cell(1, r_hdr, "Status",                          c_hdr, c_blue)
+
+    sc = score
+    score_col = sc >= 11 ? c_good : sc >= 9 ? c_mid : sc >= 7 ? c_warn : c_bad
+    f_cell(0, r_score, "SCORE (0 - 13)",           c_dark, c_gray)
+    f_cell(1, r_score, str.tostring(sc) + " / 13", score_col, c_white)
+
+    f_row(r_ema,    "EMA 9 > 21 > 50 > 200",         ema_aligned)
+    f_row(r_trend,  "Price > EMA 50 and EMA 200",    bull_trend)
+    f_row(r_rsi,    "RSI 50 - 75 Zone",              rsi_bullish)
+    f_row(r_macd,   "MACD Bull and Hist Rising",     macd_bullish and macd_hist_rising)
+    f_row(r_vol,    "Volume Surge and OBV Accum",    vol_surge and vol_obv_bull)
+    f_row(r_adx,    "ADX Strong and DI+ > DI-",     adx_valid and di_bullish)
+    f_row(r_bb,     "Above BB Midline",              bb_mid_bull)
+
+    hammer_lbl = isHammer ? "[HAMMER]" : "[--]"
+    table.cell(dash, 0, r_hammer, "Hammer Candle", bgcolor=c_dark, text_color=c_gray, text_size=size.small, text_halign=text.align_left)
+    table.cell(dash, 1, r_hammer, hammer_lbl, bgcolor=isHammer ? color.new(#4A148C, 0) : c_no, text_color=isHammer ? c_purp : c_bad, text_size=size.small, text_halign=text.align_center)
+
+    if show_daily_row
+        f_row(r_daily, "Daily Trend Anchor (EMA stack)", dailyTrend)
+    if show_rs_row
+        f_row(r_rs, use_rs ? "True RS > SPY (active)" : "True RS (disabled)", strongRS)
+    if show_liq_row
+        f_row(r_liq, "US Liquidity (Price/Vol/$Vol)", liquidityOk)
+    if show_mcdx_row
+        mcdx_lbl = "MCDX " + str.tostring(math.round(mcdx)) + (mcdxBull ? "  BULL" : "  BEAR")
+        table.cell(dash, 0, r_mcdx, "MCDX Smart Money", bgcolor=c_dark, text_color=c_gray, text_size=size.small, text_halign=text.align_left)
+        table.cell(dash, 1, r_mcdx, mcdx_lbl, bgcolor=mcdxBull ? c_yes : c_no, text_color=mcdxBull ? c_good : c_bad, text_size=size.small, text_halign=text.align_center)
+
+    stop_ema_str = not na(stop_ema_val) ? str.tostring(math.round(stop_ema_val, 2)) : "--"
+    stop_mode_short = stop_mode == "Fundamental (EMA 200)" ? "EMA200 @ " + stop_ema_str : "EMA20 @ " + stop_ema_str
+    table.cell(dash, 0, r_stop, "Stop Mode", bgcolor=c_dark, text_color=c_gray, text_size=size.small, text_halign=text.align_left)
+    table.cell(dash, 1, r_stop, stop_mode_short, bgcolor=hard_stop_hit ? c_no : c_dark, text_color=hard_stop_hit ? c_bad : c_amber, text_size=size.small, text_halign=text.align_center)
+
+    state_lbl = tp1_hit ? "TP1 HIT — TRAIL" : tier1_buy ? "T1  HIGH CONVICTION" : tier2_buy ? "T2  MOMENTUM BUY" : tier3_watch ? "WATCHLIST" : coil_signal ? "VCP COIL — PREPARE" : exit_signal ? "EXIT  --  AVOID" : "NEUTRAL"
+    state_col = tp1_hit ? c_amber : tier1_buy ? c_good : tier2_buy ? c_mid : tier3_watch ? c_warn : coil_signal ? c_purp : exit_signal ? c_bad : c_gray
+    f_cell(0, r_sig, "SIGNAL",   c_bg,   c_gray)
+    f_cell(1, r_sig, state_lbl, state_col, c_white)
+
+    sl_str  = not na(sl_locked)  ? str.tostring(math.round(sl_locked,  2)) : "--"
+    tp1_str = not na(tp1_locked) ? str.tostring(math.round(tp1_locked, 2)) : (tp1_hit ? "HIT" : "--")
+    tp2_str = not na(tp2_locked) ? str.tostring(math.round(tp2_locked, 2)) : (tp2_hit ? "HIT" : "--")
+    trail_str = not na(trail_stop) ? "TRAIL:" + str.tostring(math.round(trail_stop, 2)) : "--"
+    f_cell(0, r_risk, "SL / TP1 / TP2 / Trail",                                        c_hdr, c_gray)
+    f_cell(1, r_risk, sl_str + " / " + tp1_str + " / " + tp2_str + " / " + trail_str, c_hdr, c_amber)
+
+// ============================================================
+// ALERTS
+// ============================================================
+alertcondition(new_coil, title="VCP COIL — Prepare Entry", message="US MSS v1 | {{ticker}} | VCP COIL: BB at tightest + volume dried up. Breakout likely within 1-5 days.")
+alertcondition(new_t1,   title="T1 HIGH CONVICTION BUY",  message="US MSS v1 | {{ticker}} | TIER 1 | Price={{close}} | Score>=11")
+alertcondition(new_t2,   title="T2 MOMENTUM BUY",         message="US MSS v1 | {{ticker}} | TIER 2 | Price={{close}} | Score>=9")
+alertcondition(new_t3,   title="WATCHLIST PRE-BREAKOUT",  message="US MSS v1 | {{ticker}} | WATCHLIST | Price={{close}} | Score>=7")
+alertcondition(tp1_reached, title="TP1 Hit — Sell 1/3",  message="US MSS v1 | {{ticker}} | TP1 HIT: Sell 1/3. Trail stop activated.")
+alertcondition(tp2_reached, title="TP2 Hit — Sell 1/3",  message="US MSS v1 | {{ticker}} | TP2 HIT: Sell 1/3. Trail remainder.")
+alertcondition(new_exit or hard_stop_hit or trail_stop_hit, title="EXIT SIGNAL", message="US MSS v1 | {{ticker}} | EXIT | Price={{close}}")
+
+// ============================================================
+// HIDDEN PLOTS (Pine Screener columns / strategy export)
+// ============================================================
+plot(score,                title="Score 0-13",   display=display.none)
+plot(rsi,                  title="RSI Value",     display=display.none)
+plot(adx_val,              title="ADX Value",     display=display.none)
+plot(mcdx,                 title="MCDX Value",    display=display.none)
+plot(new_t1     ? 1 : 0,  title="Tier1 Signal",  display=display.none)
+plot(new_t2     ? 1 : 0,  title="Tier2 Signal",  display=display.none)
+plot(new_coil   ? 1 : 0,  title="Coil Signal",   display=display.none)
+plot(vol_surge  ? 1 : 0,  title="Vol Surge",     display=display.none)
+plot(dailyTrend ? 1 : 0,  title="Daily Trend",   display=display.none)
+plot(strongRS   ? 1 : 0,  title="RS vs SPY",     display=display.none)
+plot(liquidityOk ? 1 : 0, title="Liquidity OK",  display=display.none)
+plot(isHammer   ? 1 : 0,  title="Hammer Candle", display=display.none)
+
+// ============================================================
+// END OF SCRIPT
+// ============================================================

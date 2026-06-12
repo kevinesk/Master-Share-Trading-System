@@ -1,0 +1,242 @@
+//@version=5
+// ================================================================
+// Pro Quant Desk (US) v1 — Flagship dashboard for US equities
+// US-market sibling of "Pro Quant Desk (KLSE) v9".
+// Built on US Engine v1. Self-contained — paste & add to chart.
+//
+// LAYERS:
+//   1. Macro Risk Gauge (equity-only) — SPY 200MA + QQQ 200MA + SPY 50MA + RSP/SPY breadth (0-4)
+//   2. Two-layer Relative Strength — stock vs sector ETF, ETF vs SPX
+//   3. Weinstein Stage (30W MA)
+//   4. Stovall sector rotation — 11 SPDR sectors vs economic phase
+//   5. Position sizing — US single shares, USD, 5/8/1% defaults
+//   6. Anti-FOMO pivot extension
+//   7. Marks cycle sizing bias (manual sentiment input)
+//   8. 7-gate decision verdict
+//   9. Dashboard table + alerts
+//
+// NOTE: Macro/RS pulls use the chart's symbol context. Best run on a
+// US equity (NYSE/NASDAQ) on the Daily timeframe.
+// ================================================================
+indicator("Pro Quant Desk (US) v1", overlay=true, max_labels_count=100, max_lines_count=10)
+
+// ================================================================
+// 1. INPUTS
+// ================================================================
+grp_macro = "Macro Tickers (equity ETFs only — work with free US data)"
+sym_spx = input.symbol("AMEX:SPY", "S&P 500 proxy (SPY)", group=grp_macro,
+  tooltip="SPY ETF as the SPX proxy (RS & MA logic identical — ratios scale-invariant). Avoid the SPX INDEX (needs paid entitlement).")
+sym_ndx = input.symbol("NASDAQ:QQQ", "Nasdaq 100 proxy (QQQ)", group=grp_macro,
+  tooltip="QQQ ETF as the NDX proxy. Avoid the NDX index (needs paid data).")
+sym_breadth = input.symbol("AMEX:RSP", "Breadth proxy (equal-weight S&P)", group=grp_macro,
+  tooltip="RSP = equal-weight S&P 500. RSP/SPY rising = broad participation (an equity-only stand-in for McClellan breadth, since VIX/breadth index data needs a paid plan).")
+breadth_len = input.int(20, "Breadth lookback (bars)", minval=5, maxval=120, group=grp_macro)
+
+grp_rs = "Relative Strength"
+sym_sector = input.symbol("AMEX:XLK", "This stock's sector ETF", group=grp_rs,
+  tooltip="Match to the chart stock's sector (all SPDR sectors use the AMEX: prefix): AMEX:XLK Tech, AMEX:XLF Financials, AMEX:XLE Energy, AMEX:XLV Health, AMEX:XLY Discretionary, AMEX:XLP Staples, AMEX:XLI Industrials, AMEX:XLB Materials, AMEX:XLRE RealEstate, AMEX:XLU Utilities, AMEX:XLC Communications")
+rs_len = input.int(50, "RS lookback (bars)", minval=10, maxval=252, group=grp_rs)
+
+grp_sec = "Sector Tag (for Stovall rotation)"
+sector = input.string("Technology", "This stock's sector", group=grp_sec,
+  options=["Technology","Financials","Energy","Healthcare","Discretionary","Staples",
+           "Industrials","Materials","Real Estate","Utilities","Communications"])
+stovall_phase = input.string("Early Recovery", "US Economic Phase", group=grp_sec,
+  options=["Early Recovery","Full Recovery","Early Slowdown","Recession"],
+  tooltip="Drives favored-sector check per Stovall/Fidelity rotation model.")
+
+grp_size = "Position Sizing (US defaults)"
+portfolio_usd = input.float(50000.0, "Portfolio Value (USD)", minval=1000, step=1000, group=grp_size)
+max_pos_pct = input.float(8.0, "Max Position % of Portfolio", minval=1, maxval=20, step=1, group=grp_size)
+tgt_pos_pct = input.float(5.0, "Target Position %",          minval=1, maxval=15, step=1, group=grp_size)
+risk_per_trd= input.float(1.0, "Max Risk per Trade %",       minval=0.25, maxval=3, step=0.25, group=grp_size)
+stop_dist_p = input.float(7.0, "Assumed Stop Distance %",    minval=1, maxval=20, step=0.5, group=grp_size)
+
+grp_marks = "Marks Cycle (manual sentiment 1-10)"
+marks_score = input.int(5, "Marks Cycle Score", minval=1, maxval=10, group=grp_marks,
+  tooltip="1 = max fear, 5-6 = neutral, 10 = max euphoria. Drives sizing bias.")
+
+grp_fomo = "Anti-FOMO"
+fomo_lookback = input.int(15, "Pivot lookback (bars)", minval=5, maxval=60, group=grp_fomo)
+fomo_extend_pct = input.float(1.0, "FOMO if price > N% above pivot", minval=0.5, maxval=5, step=0.1, group=grp_fomo)
+
+grp_disp = "Display"
+show_table = input.bool(true, "Show Dashboard (top-right)", group=grp_disp)
+show_fomo_lbl = input.bool(true, "Show FOMO warning label", group=grp_disp)
+show_stage = input.bool(true, "Show Weinstein stage marker", group=grp_disp)
+tbl_bg = input.color(#0a0e27, "Table Background", group=grp_disp)
+tbl_hdr_bg = input.color(#16213e, "Header Background", group=grp_disp)
+txt_size_in = input.string("Normal", "Text Size", options=["Small","Normal","Large"], group=grp_disp)
+txt_size = txt_size_in == "Small" ? size.small : txt_size_in == "Large" ? size.large : size.normal
+
+// ================================================================
+// 2. MACRO RISK GAUGE (equity-only: SPY trend + QQQ trend + SPY 50MA + RSP/SPY breadth)
+// ================================================================
+spx     = request.security(sym_spx,     "D", close,              lookahead=barmerge.lookahead_off, ignore_invalid_symbol=true)
+spx_ma  = request.security(sym_spx,     "D", ta.sma(close, 200), lookahead=barmerge.lookahead_off, ignore_invalid_symbol=true)
+spx_ma50= request.security(sym_spx,     "D", ta.sma(close, 50),  lookahead=barmerge.lookahead_off, ignore_invalid_symbol=true)
+ndx     = request.security(sym_ndx,     "D", close,              lookahead=barmerge.lookahead_off, ignore_invalid_symbol=true)
+ndx_ma  = request.security(sym_ndx,     "D", ta.sma(close, 200), lookahead=barmerge.lookahead_off, ignore_invalid_symbol=true)
+rsp     = request.security(sym_breadth, "D", close,              lookahead=barmerge.lookahead_off, ignore_invalid_symbol=true)
+
+m1 = not na(spx) and not na(spx_ma)   and spx > spx_ma      // long-term trend
+m2 = not na(ndx) and not na(ndx_ma)   and ndx > ndx_ma      // growth trend
+m3 = not na(spx) and not na(spx_ma50) and spx > spx_ma50    // intermediate trend
+// Breadth: equal-weight (RSP) vs cap-weight (SPY) ratio rising = broad participation
+br_ratio = not na(rsp) and not na(spx) and spx > 0 ? rsp / spx : na
+m4 = not na(br_ratio) and not na(br_ratio[breadth_len]) and br_ratio > br_ratio[breadth_len]
+
+macro_max = (not na(spx) and not na(spx_ma) ? 1 : 0) + (not na(ndx) and not na(ndx_ma) ? 1 : 0) + (not na(spx_ma50) ? 1 : 0) + (not na(br_ratio) ? 1 : 0)
+macro_score = (m1 ? 1 : 0) + (m2 ? 1 : 0) + (m3 ? 1 : 0) + (m4 ? 1 : 0)
+macro_ok = macro_max > 0 and macro_score >= macro_max - 1   // risk-on = at most one signal red
+macro_sfx = " " + str.tostring(macro_score) + "/" + str.tostring(macro_max)
+
+macro_label = macro_max == 0 ? "NO MACRO DATA" :
+              macro_score == macro_max ? "RISK-ON" + macro_sfx :
+              macro_ok                 ? "MOSTLY ON" + macro_sfx :
+              "RISK-OFF" + macro_sfx
+macro_col = macro_max == 0 ? color.gray : macro_score == macro_max ? color.lime : macro_ok ? color.green : macro_score >= 1 ? color.orange : color.red
+
+// ================================================================
+// 3. TWO-LAYER RELATIVE STRENGTH
+// ================================================================
+// Layer 1: stock vs its sector ETF
+etf_close = request.security(sym_sector, timeframe.period, close, lookahead=barmerge.lookahead_off, ignore_invalid_symbol=true)
+rs1_ratio = not na(etf_close) and etf_close > 0 ? close / etf_close : na
+rs1_lead  = not na(rs1_ratio) and rs1_ratio > rs1_ratio[rs_len]
+// Layer 2: sector ETF vs SPX
+spx_chart = request.security(sym_spx, timeframe.period, close, lookahead=barmerge.lookahead_off, ignore_invalid_symbol=true)
+rs2_ratio = not na(spx_chart) and spx_chart > 0 and not na(etf_close) ? etf_close / spx_chart : na
+rs2_lead  = not na(rs2_ratio) and rs2_ratio > rs2_ratio[rs_len]
+
+rs_verdict = rs1_lead and rs2_lead ? "LEADER in LEADING group" :
+             rs1_lead and not rs2_lead ? "Leads weak group" :
+             not rs1_lead and rs2_lead ? "Laggard in strong group" :
+             "Laggard in weak group"
+rs_col = rs1_lead and rs2_lead ? color.lime : (rs1_lead or rs2_lead) ? color.orange : color.red
+
+// ================================================================
+// 4. WEINSTEIN STAGE
+// ================================================================
+ema30W = ta.ema(close, 150)
+ema30W_slope = ema30W > ema30W[20]
+ema30W_flat  = math.abs(ema30W - ema30W[20]) / ema30W < 0.01
+stage_label = close < ema30W and not ema30W_slope ? "4-DOWNTREND" :
+              close > ema30W and ema30W_slope     ? "2-UPTREND"   :
+              close > ema30W and ema30W_flat      ? "3-TOPPING"   :
+              close < ema30W and ema30W_flat      ? "1-BASE"      :
+              close > ema30W and not ema30W_slope ? "3-TOPPING"   : "1-BASE"
+stage_color = stage_label == "2-UPTREND" ? color.green : stage_label == "1-BASE" ? color.orange :
+              stage_label == "3-TOPPING" ? color.red : color.gray
+plot(ema30W, "30W EMA (Weinstein)", color=stage_color, linewidth=2)
+
+// ================================================================
+// 5. STOVALL SECTOR ROTATION CHECK (11 SPDR sectors)
+// ================================================================
+favored = false
+if stovall_phase == "Early Recovery"
+    favored := sector == "Discretionary" or sector == "Financials" or sector == "Industrials" or sector == "Real Estate" or sector == "Technology"
+if stovall_phase == "Full Recovery"
+    favored := sector == "Technology" or sector == "Communications" or sector == "Industrials" or sector == "Energy" or sector == "Materials"
+if stovall_phase == "Early Slowdown"
+    favored := sector == "Energy" or sector == "Materials" or sector == "Staples" or sector == "Healthcare"
+if stovall_phase == "Recession"
+    favored := sector == "Staples" or sector == "Utilities" or sector == "Healthcare"
+stovall_tag = favored ? "FAVORED" : "NOT FAVORED"
+stovall_col = favored ? color.lime : color.red
+
+// ================================================================
+// 6. POSITION SIZING (single shares, USD)
+// ================================================================
+entry_price = close
+max_sh   = entry_price > 0 ? math.floor((portfolio_usd * max_pos_pct / 100) / entry_price) : 0
+tgt_sh   = entry_price > 0 ? math.floor((portfolio_usd * tgt_pos_pct / 100) / entry_price) : 0
+risk_usd = portfolio_usd * risk_per_trd / 100
+risk_psh = entry_price * (stop_dist_p / 100)
+risk_sh  = risk_psh > 0 ? math.floor(risk_usd / risk_psh) : 0
+final_sh = math.min(math.min(max_sh, tgt_sh > 0 ? tgt_sh : max_sh), risk_sh > 0 ? risk_sh : max_sh)
+final_cost = final_sh * entry_price
+final_pct  = portfolio_usd > 0 ? (final_cost / portfolio_usd) * 100 : 0
+
+// ================================================================
+// 7. ANTI-FOMO PIVOT EXTENSION
+// ================================================================
+pivot_price = ta.highest(high, fomo_lookback)[1]
+dist_pivot  = pivot_price > 0 ? ((close / pivot_price) - 1) * 100 : 0
+fomo_warn   = dist_pivot > fomo_extend_pct
+fomo_text =
+  dist_pivot > 3.0 ? "EXTENDED — DO NOT CHASE" :
+  dist_pivot > fomo_extend_pct ? "LATE — small tranche only" :
+  dist_pivot >= -1.0 ? "BUY ZONE" : "BELOW PIVOT"
+
+if show_fomo_lbl and barstate.islast and fomo_warn
+    label.new(bar_index, high * 1.02, fomo_text, color=color.new(color.red, 20),
+              textcolor=color.white, style=label.style_label_down, size=size.normal)
+if show_stage and barstate.islast
+    label.new(bar_index, low * 0.98, "Stage " + stage_label, color=color.new(stage_color, 30),
+              textcolor=color.white, style=label.style_label_up, size=size.small)
+
+// ================================================================
+// 8. MARKS CYCLE SIZING BIAS
+// ================================================================
+marks_bias = marks_score <= 3 ? "EXTREME FEAR — Defensive/Cash" :
+             marks_score <= 6 ? "NORMAL — Active deploy" :
+             marks_score <= 8 ? "ELEVATED — Trim & trail" : "EUPHORIA — Raise cash 30-50%"
+size_mult = marks_score <= 3 ? 0.5 : marks_score <= 6 ? 1.0 : marks_score <= 8 ? 0.7 : 0.3
+adj_sh   = math.floor(final_sh * size_mult)
+adj_cost = adj_sh * entry_price
+adj_pct  = portfolio_usd > 0 ? (adj_cost / portfolio_usd) * 100 : 0
+
+// ================================================================
+// 9. 7-GATE DECISION VERDICT
+// ================================================================
+gate1_macro  = macro_ok
+gate2_rs     = rs1_lead and rs2_lead
+gate3_stage  = stage_label == "2-UPTREND"
+gate4_sector = favored
+gate5_fomo   = not fomo_warn
+gate6_size   = adj_sh >= 1 and adj_pct <= max_pos_pct
+gate7_marks  = marks_score >= 3 and marks_score <= 8
+gates_passed = (gate1_macro ? 1:0)+(gate2_rs ? 1:0)+(gate3_stage ? 1:0)+(gate4_sector ? 1:0)+(gate5_fomo ? 1:0)+(gate6_size ? 1:0)+(gate7_marks ? 1:0)
+gate_verdict = gates_passed == 7 ? "ALL 7/7 — EXECUTE" :
+               gates_passed >= 6 ? "6/7 — Review red gate" :
+               gates_passed >= 4 ? str.tostring(gates_passed) + "/7 — Marginal" :
+               str.tostring(gates_passed) + "/7 — SKIP"
+gate_col = gates_passed >= 6 ? color.lime : gates_passed >= 4 ? color.orange : color.red
+
+// ================================================================
+// 10. DASHBOARD
+// ================================================================
+var table dash = table.new(position.top_right, 2, 16, bgcolor=tbl_bg, border_color=color.new(color.gray,40), border_width=1, frame_color=color.new(color.gray,20), frame_width=1)
+f_cell(int r, string lbl, string val, color valcol) =>
+    table.cell(dash, 0, r, lbl, text_color=color.white, bgcolor=tbl_bg, text_size=txt_size, text_halign=text.align_left)
+    table.cell(dash, 1, r, val, text_color=valcol, bgcolor=tbl_bg, text_size=txt_size, text_halign=text.align_right)
+
+if show_table and barstate.islast
+    table.cell(dash, 0, 0, "PRO QUANT DESK (US)", text_color=color.yellow, bgcolor=tbl_hdr_bg, text_size=txt_size, text_halign=text.align_left)
+    table.cell(dash, 1, 0, "──────", text_color=color.yellow, bgcolor=tbl_hdr_bg, text_size=txt_size, text_halign=text.align_right)
+    f_cell(1,  "Macro Gauge", macro_label, macro_col)
+    f_cell(2,  "  SPY>200 / QQQ>200", (m1?"Y":"N")+" / "+(m2?"Y":"N"), m1 and m2 ? color.lime : color.orange)
+    f_cell(3,  "  SPY>50 / Breadth", (m3?"Y":"N")+" / "+(m4?"Y":"N"), m3 and m4 ? color.lime : color.orange)
+    f_cell(4,  "Breadth (RSP/SPY)", m4?"broadening":"narrowing", m4?color.lime:color.orange)
+    f_cell(5,  "RS verdict", rs_verdict, rs_col)
+    f_cell(6,  "Weinstein Stage", stage_label, stage_color)
+    f_cell(7,  "Stovall ("+sector+")", stovall_tag, stovall_col)
+    f_cell(8,  "Marks Bias", marks_bias, marks_score>=3 and marks_score<=7 ? color.lime : color.orange)
+    f_cell(9,  "Pivot ("+str.tostring(fomo_lookback)+"b)", str.tostring(pivot_price,"#.##"), color.white)
+    f_cell(10, "Dist vs Pivot", str.tostring(dist_pivot,"#.##")+"%", fomo_warn?color.red:color.lime)
+    f_cell(11, "FOMO Check", fomo_text, fomo_warn?color.red:color.lime)
+    f_cell(12, "Size (raw)", str.tostring(final_sh)+" sh ("+str.tostring(final_pct,"#.#")+"%)", color.white)
+    f_cell(13, "Size (Marks adj)", str.tostring(adj_sh)+" sh ("+str.tostring(adj_pct,"#.#")+"%)", color.aqua)
+    f_cell(14, "Risk $ / trade", "$"+str.tostring(risk_usd,"#"), color.white)
+    f_cell(15, "GATE VERDICT (7)", gate_verdict, gate_col)
+
+// ================================================================
+// 11. ALERTS
+// ================================================================
+all_gates = gate1_macro and gate2_rs and gate3_stage and gate4_sector and gate5_fomo and gate6_size and gate7_marks
+alertcondition(all_gates and not all_gates[1], title="US PQD ALL GATES GREEN", message="7/7 gates green on {{ticker}} — execute per entry plan")
+alertcondition(macro_ok and not macro_ok[1], title="US Macro turned RISK-ON", message="US macro gauge flipped risk-on (at most one signal red)")
+alertcondition(not macro_ok and macro_ok[1], title="US Macro turned RISK-OFF", message="US macro gauge flipped risk-off")
+alertcondition(stage_label == "2-UPTREND" and stage_label[1] != "2-UPTREND", title="US Weinstein Stage 2", message="{{ticker}} entered Stage 2 uptrend")
+alertcondition(fomo_warn and not fomo_warn[1], title="US FOMO Extension", message="{{ticker}} extended past pivot — do not chase")

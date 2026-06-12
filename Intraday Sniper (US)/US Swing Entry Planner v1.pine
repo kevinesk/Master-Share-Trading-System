@@ -1,0 +1,215 @@
+//@version=5
+// ============================================================
+// US Swing Entry Planner v1  (pre-market order ticket)
+// Market   : US (NYSE / NASDAQ) — run on the chart symbol, DAILY
+// Use case : You trade US from Malaysia. The US session runs overnight,
+//            so you analyse the COMPLETED daily candle during your day
+//            and PLACE ORDERS BEFORE US OPEN. This tool reads the daily
+//            chart and prints the exact order ticket to enter:
+//              - Order type (LIMIT BUY for a pullback / BUY-STOP for a breakout)
+//              - Buy price, Stop price, TP1, TP2
+//              - Share count (your 5/8/1% sizing, single shares)
+//              - Risk $ and Reward:Risk
+//
+// Reframed from "Intraday Sniper" (5-min) -> daily swing entry, because
+// you are SWING-ONLY and not watching the US tape live.
+//
+// DATA: uses ONLY the chart symbol (close/EMA/ATR/pivots). No request.security,
+//       no benchmark/index pulls -> works on free delayed US equity data.
+//
+// Two entry models:
+//   PULLBACK : uptrend pulls back to the rising fast EMA -> LIMIT BUY at support
+//   BREAKOUT : price coils just under a pivot high      -> BUY-STOP above pivot
+// Anti-FOMO: if price is extended above the EMA, it says WAIT (no order).
+// ============================================================
+indicator("US Swing Entry Planner v1", overlay=true, max_lines_count=20, max_labels_count=50)
+
+// ============================================================
+// INPUTS
+// ============================================================
+g_tr = "Trend / EMAs"
+ema_fast_len = input.int(10,  "Fast EMA (pullback buy line)", minval=3,  group=g_tr)
+ema_slow_len = input.int(20,  "Slow EMA",                     minval=5,  group=g_tr)
+ema_anc_len  = input.int(50,  "Anchor EMA (trend floor)",     minval=20, group=g_tr)
+ema_long_len = input.int(200, "Long EMA (regime)",            minval=50, group=g_tr)
+
+g_pb = "Pullback Entry"
+pull_band_pct = input.float(2.0, "Pullback band above Fast EMA (%)", minval=0.5, maxval=8.0, step=0.5, group=g_pb,
+  tooltip="Counts as a pullback when price is within this % above the fast EMA (or below it but still above the anchor EMA).")
+
+g_bo = "Breakout Entry"
+pivot_lookback = input.int(20,  "Pivot High Lookback (bars)", minval=5,  group=g_bo)
+near_pivot_pct = input.float(4.0, "Coiling: within % below pivot", minval=1.0, maxval=10.0, step=0.5, group=g_bo)
+bo_buffer_pct  = input.float(0.3, "Buy-stop buffer above pivot (%)", minval=0.0, maxval=2.0, step=0.1, group=g_bo)
+
+g_fomo = "Anti-FOMO"
+ext_thresh_pct = input.float(6.0, "Extended if price > N% above Fast EMA", minval=2.0, maxval=20.0, step=0.5, group=g_fomo,
+  tooltip="If price is this far above the fast EMA, the chase is too late — tool says WAIT.")
+
+g_risk = "ATR Risk"
+atr_len     = input.int(14,    "ATR Period",  group=g_risk)
+atr_sl_mult = input.float(2.0, "Stop ATR x",  minval=0.5, step=0.1, group=g_risk)
+atr_tp1_mult= input.float(3.0, "TP1 ATR x",   minval=0.5, step=0.1, group=g_risk)
+atr_tp2_mult= input.float(6.0, "TP2 ATR x",   minval=1.0, step=0.1, group=g_risk)
+
+g_acct = "Account / Sizing (US single shares)"
+portfolio_usd = input.float(50000.0, "Portfolio Value (USD)", minval=1000, step=1000, group=g_acct)
+risk_per_trd  = input.float(1.0,  "Risk per Trade %",      minval=0.25, maxval=3, step=0.25, group=g_acct)
+max_pos_pct   = input.float(8.0,  "Max Position % of Portfolio", minval=1, maxval=20, step=1, group=g_acct)
+
+g_ham = "Hammer Confluence"
+use_hammer       = input.bool(true, "Flag hammer on the entry bar", group=g_ham)
+hammer_wick_mult = input.float(2.0, "Min Lower Wick / Body", minval=1.0, step=0.1, group=g_ham)
+hammer_upper_max = input.float(0.5, "Max Upper Wick / Body", minval=0.0, step=0.1, group=g_ham)
+
+g_disp = "Display"
+show_lines = input.bool(true, "Plot order levels (Buy/Stop/TP)", group=g_disp)
+hudPosStr  = input.string("Top Right", "HUD Position", options=["Top Left","Top Center","Top Right","Bottom Left","Bottom Center","Bottom Right"], group=g_disp)
+txt_size_in= input.string("Normal", "Text Size", options=["Small","Normal","Large"], group=g_disp)
+txt_size   = txt_size_in == "Small" ? size.small : txt_size_in == "Large" ? size.large : size.normal
+
+// ============================================================
+// COLORS
+// ============================================================
+c_good=color.new(#00E676,0)
+c_warn=color.new(#FFD740,0)
+c_bad =color.new(#FF5252,0)
+c_blue=color.new(#2196F3,0)
+c_gray=color.new(#9E9E9E,0)
+c_orng=color.new(#FF9800,0)
+c_aqua=color.new(#00BCD4,0)
+c_purp=color.new(#9C27B0,0)
+c_white=color.white
+c_bg  =color.new(#0D0D0D,0)
+c_dark=color.new(#161B22,0)
+c_hdr =color.new(#1A237E,0)
+
+// ============================================================
+// CORE CALCS (chart symbol only)
+// ============================================================
+ema_fast = ta.ema(close, ema_fast_len)
+ema_slow = ta.ema(close, ema_slow_len)
+ema_anc  = ta.ema(close, ema_anc_len)
+ema_long = ta.ema(close, ema_long_len)
+atr      = ta.atr(atr_len)
+
+plot(ema_fast, "Fast EMA", color=color.new(color.aqua,30),   linewidth=1)
+plot(ema_slow, "Slow EMA", color=color.new(color.yellow,40), linewidth=1)
+plot(ema_anc,  "Anchor EMA", color=color.new(color.orange,20), linewidth=2)
+plot(ema_long, "Long EMA",  color=color.new(color.red,40),   linewidth=2)
+
+// Uptrend context
+uptrend = close > ema_anc and ema_anc > ema_long and ema_anc > ema_anc[10]
+
+// Pivot high (recent resistance), confirmed (offset to avoid lookahead)
+pivot_high = ta.highest(high, pivot_lookback)[1]
+
+// Hammer on the latest bar
+body       = math.abs(close - open)
+totalRange = high - low
+lowerWick  = math.min(open, close) - low
+upperWick  = high - math.max(open, close)
+isHammer   = use_hammer and totalRange > 0 and body > 0
+           and lowerWick >= body * hammer_wick_mult
+           and upperWick <= body * hammer_upper_max
+           and close >= open
+
+// Extension vs fast EMA (anti-FOMO)
+ext_pct  = ema_fast > 0 ? (close - ema_fast) / ema_fast * 100 : 0.0
+extended = ext_pct > ext_thresh_pct
+
+// Setup detection
+near_pivot   = not na(pivot_high) and close < pivot_high and (pivot_high - close) / close * 100 <= near_pivot_pct
+at_pullback  = close <= ema_fast * (1 + pull_band_pct / 100) and close >= ema_anc
+
+// Mode priority: no-trend > extended > breakout(coil under pivot) > pullback > none
+mode = not uptrend ? "NO TREND" :
+       extended    ? "EXTENDED" :
+       near_pivot  ? "BREAKOUT" :
+       at_pullback ? "PULLBACK" : "NO SETUP"
+
+// ============================================================
+// ORDER TICKET
+// ============================================================
+is_bo = mode == "BREAKOUT"
+is_pb = mode == "PULLBACK"
+has_order = is_bo or is_pb
+
+order_type = is_bo ? "BUY-STOP" : is_pb ? "LIMIT BUY" : "WAIT"
+entry =
+  is_bo ? pivot_high * (1 + bo_buffer_pct / 100) :
+  is_pb ? math.min(close, ema_fast) : na
+
+stop = not na(entry) ? entry - atr * atr_sl_mult : na
+tp1  = not na(entry) ? entry + atr * atr_tp1_mult : na
+tp2  = not na(entry) ? entry + atr * atr_tp2_mult : na
+
+risk_per_share = not na(entry) and not na(stop) ? entry - stop : na
+risk_usd       = portfolio_usd * risk_per_trd / 100
+sh_risk = not na(risk_per_share) and risk_per_share > 0 ? math.floor(risk_usd / risk_per_share) : 0
+sh_max  = not na(entry) and entry > 0 ? math.floor(portfolio_usd * max_pos_pct / 100 / entry) : 0
+shares  = math.min(sh_risk, sh_max)
+cost    = shares * (na(entry) ? 0 : entry)
+pos_pct = portfolio_usd > 0 ? cost / portfolio_usd * 100 : 0
+rr1 = not na(tp1) and risk_per_share > 0 ? (tp1 - entry) / risk_per_share : na
+rr2 = not na(tp2) and risk_per_share > 0 ? (tp2 - entry) / risk_per_share : na
+
+verdict = mode == "NO TREND" ? "WAIT — not in uptrend" :
+          mode == "EXTENDED" ? "WAIT — too extended (" + str.tostring(ext_pct, "#.#") + "% over EMA)" :
+          mode == "NO SETUP" ? "WAIT — no pullback/breakout" :
+          "PLACE " + order_type + (is_pb and isHammer ? "  (hammer +)" : "")
+verdict_col = has_order ? c_good : mode == "EXTENDED" ? c_bad : c_warn
+
+// ============================================================
+// PLOT ORDER LEVELS (last bars)
+// ============================================================
+plot(show_lines and not na(entry) ? entry : na, "Buy",  color=c_blue, linewidth=2, style=plot.style_linebr)
+plot(show_lines and not na(stop)  ? stop  : na, "Stop", color=c_bad,  linewidth=1, style=plot.style_linebr)
+plot(show_lines and not na(tp1)   ? tp1   : na, "TP1",  color=c_good, linewidth=1, style=plot.style_linebr)
+plot(show_lines and not na(tp2)   ? tp2   : na, "TP2",  color=c_warn, linewidth=1, style=plot.style_linebr)
+
+// Fresh-setup markers + alert triggers
+new_pb = is_pb and mode[1] != "PULLBACK"
+new_bo = is_bo and mode[1] != "BREAKOUT"
+plotshape(new_pb, "Pullback setup", style=shape.labelup, location=location.belowbar, color=c_blue, textcolor=color.white, text="PB", size=size.small)
+plotshape(new_bo, "Breakout setup", style=shape.labelup, location=location.belowbar, color=c_aqua, textcolor=color.white, text="BO", size=size.small)
+
+// ============================================================
+// HUD — ORDER TICKET
+// ============================================================
+hudPos = switch hudPosStr
+    "Top Left"      => position.top_left
+    "Top Center"    => position.top_center
+    "Top Right"     => position.top_right
+    "Bottom Left"   => position.bottom_left
+    "Bottom Center" => position.bottom_center
+    => position.bottom_right
+
+f2(float v) => na(v) ? "--" : str.tostring(v, "#.##")
+
+var table hud = table.new(hudPos, 2, 12, bgcolor=c_bg, border_color=color.new(#303030,0), border_width=1, frame_color=c_blue, frame_width=1)
+f_row(int r, string lbl, string val, color fg) =>
+    table.cell(hud, 0, r, lbl, bgcolor=c_dark, text_color=c_gray, text_size=txt_size, text_halign=text.align_left)
+    table.cell(hud, 1, r, val, bgcolor=c_dark, text_color=fg,     text_size=txt_size, text_halign=text.align_right)
+
+if barstate.islast
+    table.cell(hud, 0, 0, "US ENTRY PLANNER", bgcolor=c_hdr, text_color=c_white, text_size=txt_size, text_halign=text.align_left)
+    table.cell(hud, 1, 0, syminfo.ticker,     bgcolor=c_hdr, text_color=c_white, text_size=txt_size, text_halign=text.align_right)
+    f_row(1, "Trend", uptrend ? "UPTREND" : "NO TREND", uptrend ? c_good : c_bad)
+    f_row(2, "Mode", mode, has_order ? c_good : mode=="EXTENDED" ? c_bad : c_warn)
+    f_row(3, "Order Type", order_type, has_order ? c_aqua : c_gray)
+    f_row(4, "BUY @", f2(entry), c_blue)
+    f_row(5, "STOP @", f2(stop), c_bad)
+    f_row(6, "TP1 / TP2", f2(tp1) + " / " + f2(tp2), c_good)
+    f_row(7, "R:R (TP1/TP2)", (na(rr1)?"--":str.tostring(rr1,"#.#")) + " / " + (na(rr2)?"--":str.tostring(rr2,"#.#")), c_white)
+    f_row(8, "Shares", has_order ? str.tostring(shares) + " (" + str.tostring(pos_pct,"#.#") + "%)" : "--", c_white)
+    f_row(9, "Cost / Risk $", has_order ? "$" + str.tostring(cost,"#") + " / $" + str.tostring(risk_usd,"#") : "--", c_orng)
+    f_row(10, "Hammer", isHammer ? "YES" : "--", isHammer ? c_purp : c_gray)
+    table.cell(hud, 0, 11, "VERDICT", bgcolor=c_bg, text_color=c_gray, text_size=txt_size, text_halign=text.align_left)
+    table.cell(hud, 1, 11, verdict, bgcolor=c_bg, text_color=verdict_col, text_size=txt_size, text_halign=text.align_right)
+
+// ============================================================
+// ALERTS — fire on the daily close so you can place orders pre-open
+// ============================================================
+alertcondition(new_pb, title="US Pullback Setup", message="US Entry Planner | {{ticker}} | PULLBACK to EMA. Place LIMIT BUY per the order ticket before US open.")
+alertcondition(new_bo, title="US Breakout Setup", message="US Entry Planner | {{ticker}} | COILING under pivot. Place BUY-STOP above pivot before US open.")

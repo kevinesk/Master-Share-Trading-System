@@ -1,0 +1,29 @@
+# US Fundamentals universe — one per line: TICKER  Name
+# Lines starting with # are ignored. Edit freely to your watchlist.
+# Starter list = large, liquid US names across sectors.
+
+AAPL   Apple
+MSFT   Microsoft
+NVDA   Nvidia
+GOOGL  Alphabet
+AMZN   Amazon
+META   Meta Platforms
+AVGO   Broadcom
+LLY    Eli Lilly
+JPM    JPMorgan Chase
+V      Visa
+MA     Mastercard
+COST   Costco
+HD     Home Depot
+PG     Procter & Gamble
+JNJ    Johnson & Johnson
+UNH    UnitedHealth
+XOM    Exxon Mobil
+CVX    Chevron
+ABBV   AbbVie
+KO     Coca-Cola
+PEP    PepsiCo
+WMT    Walmart
+CRM    Salesforce
+AMD    Advanced Micro Devices
+NFLX   Netflix

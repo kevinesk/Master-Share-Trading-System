@@ -1,0 +1,120 @@
+//@version=5
+// ================================================================
+// US ENGINE v1 — Shared core for the US Market System
+// ----------------------------------------------------------------
+// This is NOT a standalone indicator. It is the canonical block of
+// reusable logic that every US tool embeds, so all tools compute
+// macro / RS / sizing IDENTICALLY. Copy the sections you need into
+// a tool, or keep this as the reference of record.
+//
+// Design rules (reliability):
+//   - All cross-symbol data via request.security(..., lookahead=barmerge.lookahead_off, ignore_invalid_symbol=true)
+//   - Macro tickers are INPUTS (availability varies by TradingView plan)
+//   - No 100-share board lots (US trades single shares)
+//   - Defaults: 5% target / 8% max / 1% risk-per-trade (US swing standard)
+// ================================================================
+
+// ----------------------------------------------------------------
+// A. MACRO TICKER INPUTS (defaults; user-overridable)
+// ----------------------------------------------------------------
+// grp_macro = "US Macro Tickers"
+// sym_spx  = input.symbol("SP:SPX",      "S&P 500 index",        group=grp_macro)
+// sym_ndx  = input.symbol("NASDAQ:NDX",  "Nasdaq 100 index",     group=grp_macro)
+// sym_vix  = input.symbol("CBOE:VIX",    "VIX (volatility)",     group=grp_macro)
+// sym_mcl  = input.symbol("USI:NYMO",    "NYSE McClellan Osc.",  group=grp_macro,
+//   tooltip="NYSE McClellan Oscillator. If your plan lacks USI:NYMO, try USI:MCOSC or leave breadth out.")
+
+// ----------------------------------------------------------------
+// B. SECURITY HELPER (non-repainting daily pull)
+// ----------------------------------------------------------------
+// NOTE: every pull uses ignore_invalid_symbol=true so one missing ticker
+// (common on non-US TradingView plans) returns na instead of crashing the tool.
+f_sec(string sym, string tf, simple string field) =>
+    request.security(sym, tf, field == "close" ? close : field == "high" ? high : field == "low" ? low : open,
+                     lookahead=barmerge.lookahead_off, ignore_invalid_symbol=true)
+
+// Convenience: daily close of a symbol on current chart timeframe
+f_close(string sym) =>
+    request.security(sym, timeframe.period, close, lookahead=barmerge.lookahead_off, ignore_invalid_symbol=true)
+
+// ----------------------------------------------------------------
+// C. MACRO RISK GAUGE
+// Returns a 0-4 score and a label. Risk-on = 4/4.
+//   +1 SPX > 200-day SMA
+//   +1 NDX > 200-day SMA
+//   +1 VIX < vix_calm (default 20) OR VIX falling
+//   +1 McClellan > 0 (breadth thrust positive)
+// ----------------------------------------------------------------
+f_macro_score(string sym_spx, string sym_ndx, string sym_vix, string sym_mcl, float vix_calm) =>
+    spx   = request.security(sym_spx, "D", close, lookahead=barmerge.lookahead_off, ignore_invalid_symbol=true)
+    spx_ma= request.security(sym_spx, "D", ta.sma(close, 200), lookahead=barmerge.lookahead_off, ignore_invalid_symbol=true)
+    ndx   = request.security(sym_ndx, "D", close, lookahead=barmerge.lookahead_off, ignore_invalid_symbol=true)
+    ndx_ma= request.security(sym_ndx, "D", ta.sma(close, 200), lookahead=barmerge.lookahead_off, ignore_invalid_symbol=true)
+    vix   = request.security(sym_vix, "D", close, lookahead=barmerge.lookahead_off, ignore_invalid_symbol=true)
+    vix_p = request.security(sym_vix, "D", close[1], lookahead=barmerge.lookahead_off, ignore_invalid_symbol=true)
+    mcl   = request.security(sym_mcl, "D", close, lookahead=barmerge.lookahead_off, ignore_invalid_symbol=true)
+    s1 = spx > spx_ma
+    s2 = ndx > ndx_ma
+    s3 = vix < vix_calm or vix < vix_p
+    s4 = mcl > 0
+    score = (s1 ? 1 : 0) + (s2 ? 1 : 0) + (s3 ? 1 : 0) + (s4 ? 1 : 0)
+    [score, s1, s2, s3, s4, spx, spx_ma, ndx, ndx_ma, vix, mcl]
+
+// ----------------------------------------------------------------
+// D. TWO-LAYER RELATIVE STRENGTH
+// Layer 1: stock vs sector ETF   (is this a leader in its group?)
+// Layer 2: sector ETF vs SPX     (is the group leading the market?)
+// RS line = ratio normalized; rising ratio over `len` = outperforming.
+// ----------------------------------------------------------------
+f_rs_ratio(string benchmark_sym, int len) =>
+    bench = request.security(benchmark_sym, timeframe.period, close, lookahead=barmerge.lookahead_off, ignore_invalid_symbol=true)
+    ratio = bench > 0 ? close / bench : na
+    rising = not na(ratio) and ratio > ratio[len]
+    [ratio, rising]
+
+f_etf_vs_spx(string etf_sym, string spx_sym, int len) =>
+    etf   = request.security(etf_sym, timeframe.period, close, lookahead=barmerge.lookahead_off, ignore_invalid_symbol=true)
+    spx   = request.security(spx_sym, timeframe.period, close, lookahead=barmerge.lookahead_off, ignore_invalid_symbol=true)
+    ratio = spx > 0 ? etf / spx : na
+    rising = not na(ratio) and ratio > ratio[len]
+    [ratio, rising]
+
+// ----------------------------------------------------------------
+// E. WEINSTEIN STAGE (universal — 30-week MA = 150-day EMA)
+// ----------------------------------------------------------------
+f_stage() =>
+    ema30W       = ta.ema(close, 150)
+    ema30W_slope = ema30W > ema30W[20]
+    ema30W_flat  = math.abs(ema30W - ema30W[20]) / ema30W < 0.01
+    lbl = close < ema30W and not ema30W_slope ? "4-DOWNTREND" :
+          close > ema30W and ema30W_slope     ? "2-UPTREND"   :
+          close > ema30W and ema30W_flat      ? "3-TOPPING"   :
+          close < ema30W and ema30W_flat      ? "1-BASE"      :
+          close > ema30W and not ema30W_slope ? "3-TOPPING"   : "1-BASE"
+    [lbl, ema30W]
+
+// ----------------------------------------------------------------
+// F. POSITION SIZING (US — single shares, USD, no board lots)
+// ----------------------------------------------------------------
+f_size(float portfolio_usd, float max_pos_pct, float tgt_pos_pct, float risk_per_trd_pct, float stop_dist_pct, float entry_price) =>
+    max_sh    = entry_price > 0 ? math.floor((portfolio_usd * max_pos_pct / 100) / entry_price) : 0
+    tgt_sh    = entry_price > 0 ? math.floor((portfolio_usd * tgt_pos_pct / 100) / entry_price) : 0
+    risk_usd  = portfolio_usd * risk_per_trd_pct / 100
+    risk_psh  = entry_price * (stop_dist_pct / 100)
+    risk_sh   = risk_psh > 0 ? math.floor(risk_usd / risk_psh) : 0
+    final_sh  = math.min(math.min(max_sh, tgt_sh > 0 ? tgt_sh : max_sh), risk_sh > 0 ? risk_sh : max_sh)
+    final_cost= final_sh * entry_price
+    final_pct = portfolio_usd > 0 ? (final_cost / portfolio_usd) * 100 : 0
+    [final_sh, final_cost, final_pct, risk_usd]
+
+// ----------------------------------------------------------------
+// G. ANTI-FOMO PIVOT EXTENSION (universal)
+// ----------------------------------------------------------------
+f_fomo(int lookback, float extend_pct) =>
+    pivot = ta.highest(high, lookback)[1]
+    dist  = pivot > 0 ? ((close / pivot) - 1) * 100 : 0
+    warn  = dist > extend_pct
+    txt = dist > 3.0 ? "EXTENDED — DO NOT CHASE" :
+          dist > extend_pct ? "LATE — small tranche only" :
+          dist >= -1.0 ? "BUY ZONE" : "BELOW PIVOT"
+    [pivot, dist, warn, txt]

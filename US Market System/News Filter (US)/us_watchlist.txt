@@ -1,0 +1,12 @@
+# US News watchlist — one TICKER per line (# = comment).
+# Keep this to the names you actually hold or are stalking for entry.
+AAPL
+MSFT
+NVDA
+GOOGL
+AMZN
+META
+AVGO
+AMD
+NFLX
+JPM

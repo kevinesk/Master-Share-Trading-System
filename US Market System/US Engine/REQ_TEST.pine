@@ -1,0 +1,32 @@
+//@version=5
+// Minimal diagnostic: can request.security pull a US symbol on this plan?
+// Run on ANY chart. Watch for a blue line and the table verdicts.
+indicator("REQ TEST", overlay=true)
+
+// These two input.symbol declarations replicate the big file's VIX/McClellan
+// fields. If REQ TEST now shows a red X, declaring an inaccessible symbol is the bug.
+test_vix = input.symbol("CBOE:VIXY", "VIX field test")
+test_mcl = input.symbol("USI:NYMO",  "McClellan field test")
+
+spy  = request.security("AMEX:SPY",   "D", close, ignore_invalid_symbol=true)
+qqq  = request.security("NASDAQ:QQQ", "D", close, ignore_invalid_symbol=true)
+xlk  = request.security("AMEX:XLK",   "D", close, ignore_invalid_symbol=true)
+vixy = request.security("CBOE:VIXY",  "D", close, ignore_invalid_symbol=true)
+nymo = request.security("USI:NYMO",   "D", close, ignore_invalid_symbol=true)
+
+plot(spy, "SPY", color=color.blue, linewidth=2)
+
+var table t = table.new(position.top_left, 2, 6, bgcolor=color.black, frame_color=color.gray, frame_width=1)
+if barstate.islast
+    table.cell(t, 0, 0, "SYMBOL", text_color=color.yellow)
+    table.cell(t, 1, 0, "VALUE",  text_color=color.yellow)
+    table.cell(t, 0, 1, "AMEX:SPY",   text_color=color.white)
+    table.cell(t, 1, 1, na(spy) ? "na/blocked" : str.tostring(spy, "#.##"), text_color=na(spy)?color.red:color.lime)
+    table.cell(t, 0, 2, "NASDAQ:QQQ", text_color=color.white)
+    table.cell(t, 1, 2, na(qqq) ? "na/blocked" : str.tostring(qqq, "#.##"), text_color=na(qqq)?color.red:color.lime)
+    table.cell(t, 0, 3, "AMEX:XLK",   text_color=color.white)
+    table.cell(t, 1, 3, na(xlk) ? "na/blocked" : str.tostring(xlk, "#.##"), text_color=na(xlk)?color.red:color.lime)
+    table.cell(t, 0, 4, "CBOE:VIXY",  text_color=color.white)
+    table.cell(t, 1, 4, na(vixy) ? "na/blocked" : str.tostring(vixy, "#.##"), text_color=na(vixy)?color.red:color.lime)
+    table.cell(t, 0, 5, "USI:NYMO",   text_color=color.white)
+    table.cell(t, 1, 5, na(nymo) ? "na/blocked" : str.tostring(nymo, "#.##"), text_color=na(nymo)?color.red:color.lime)
