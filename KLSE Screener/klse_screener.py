@@ -146,6 +146,9 @@ MIN_ACTION_SCORE   = 70          # composite score floor for any buy/alert actio
 ACTION_FUND_GRADES = {"A", "B", "C"}   # fundamental grade floor (D = monitor only)
 MAX_COIL_DIST_PCT  = 4.0         # coil must be within 4% below pivot to be actionable
 
+# ── Fundamentals freshness — warn when the merged JSON is older than this ────
+FUND_STALE_DAYS = 7
+
 # ── v2.1 — Signal journal + Bursa session length ─────────────────────────────
 JOURNAL_CSV     = OUTPUT_DIR / "signal_journal.csv"
 SESSION_MINUTES = 350            # 09:00-12:30 + 14:30-16:50 MYT
@@ -1233,8 +1236,22 @@ def main():
     fundamentals, fund_file = load_fundamentals()
     if fund_file:
         print(f"Fundamentals: merged {len(fundamentals)} stocks from {fund_file}")
+        # Staleness guard — old grades silently distort the action gate
+        # (quality gate blocks on fund grade D, so stale data = missed signals)
+        try:
+            fdate = datetime.date.fromisoformat(
+                fund_file.replace("fundamentals_", "").replace(".json", ""))
+            age_days = (datetime.date.today() - fdate).days
+            if age_days > FUND_STALE_DAYS:
+                print(f"  *** WARNING: fundamentals are {age_days} days old. "
+                      f"Quality grades may be outdated — "
+                      f"run Fundamentals\\run_fundamentals.bat ***")
+                fund_file += (f" — STALE: {age_days} days old, "
+                              f"rerun run_fundamentals.bat")
+        except ValueError:
+            pass
     else:
-        print("Fundamentals: none found — run fetch_fundamentals.py for full scoring")
+        print("Fundamentals: none found — run fetch_fundamentals_v2.py for full scoring")
 
     # Layer 1 — Macro
     print("\n[Layer 1] Checking macro conditions...")

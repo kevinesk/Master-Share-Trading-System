@@ -6,14 +6,16 @@
 
 title KLSE News Filter
 
-:: ── Set your Claude API key here (optional — enables AI classification) ──────
-:: If you have a key, replace the line below.
-:: Leave blank to use keyword-based classification instead.
-set ANTHROPIC_API_KEY=
+:: ── Claude API key (optional — enables AI classification) ────────────────────
+:: NEVER paste your key into this file (it is tracked by git). Instead, put it
+:: on one line in api_key.txt in this folder (gitignored), or set it once with:
+::     setx ANTHROPIC_API_KEY "sk-ant-..."
+:: Without a key the filter falls back to keyword-based classification.
+if exist "%~dp0api_key.txt" set /p ANTHROPIC_API_KEY=<"%~dp0api_key.txt"
 
-:: ── Install / upgrade dependencies silently ───────────────────────────────────
-echo Installing / updating dependencies...
-py -m pip install --quiet --upgrade yfinance anthropic certifi beautifulsoup4 curl_cffi
+:: ── Install missing dependencies (no auto-upgrade — keeps runs reproducible) ──
+echo Checking dependencies...
+py -m pip install --quiet yfinance anthropic certifi beautifulsoup4 curl_cffi
 
 :: ── Run the news filter ───────────────────────────────────────────────────────
 echo.
