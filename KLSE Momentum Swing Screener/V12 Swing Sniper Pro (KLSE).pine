@@ -282,27 +282,33 @@ sma50Rising = sma50 > sma50[5]
 pullback50  = low <= sma50 * (1 + proxBandPct / 100) and close > sma50 and sma50Rising and rsiVal < 70.0
 
 // ---------------------------- TIER 3 : RISK PANEL ----------------------------
+// Plan anchor (patch 2026-06-12): pre-breakout in Swing mode the trade only
+// exists at the pivot trigger, so risk, size, target and R:R are computed
+// from the PIVOT entry - close-anchored math drew the TARGET tag below the
+// BUY tag. On the breakout bar itself (and in Trend mode) entry = current
+// price, so signal-bar behaviour is unchanged.
+entryPx   = tradeMode == "Swing" and not breakout ? pivotHigh : close
 stopSwing = ta.lowest(low, stopLook) * (1 - stopBufPct / 100)
-stopAtrLv = close - atrStopMult * atrVal
+stopAtrLv = entryPx - atrStopMult * atrVal
 stopPam   = ta.lowest(low, stopLook) - pamMult * atrVal
 stopEma   = emaPb * (1 - stopBufPct / 100)
 stopLvl   = stopMode == "EMA20 (Minervini)" ? stopEma : stopMode == "PAM (swing - ATR offset)" ? stopPam : stopMode == "Swing low" ? stopSwing : stopMode == "ATR" ? stopAtrLv : math.max(stopSwing, stopAtrLv)
-riskShare = close - stopLvl
+riskShare = entryPx - stopLvl
 
 // Minervini stop-width sanity: reject setups needing a stop wider than
 // maxStopPct, and reject a stop reference sitting above price entirely
-stopPctW  = close > 0 ? riskShare / close * 100 : 0.0
+stopPctW  = entryPx > 0 ? riskShare / entryPx * 100 : 0.0
 stopOK    = riskShare > 0 and stopPctW <= maxStopPct
 
 lotsByRisk = riskShare > 0 ? math.floor(capital * riskUsed / 100 / riskShare / 100) : 0
-lotsByCap  = close > 0 ? math.floor(capital * notionalCapPct / 100 / (close * 100)) : 0
+lotsByCap  = entryPx > 0 ? math.floor(capital * notionalCapPct / 100 / (entryPx * 100)) : 0
 lots       = math.max(0, math.min(lotsByRisk, lotsByCap))
 shares     = lots * 100
-notional   = shares * close
+notional   = shares * entryPx
 riskRM     = shares * riskShare
 notionalPctUsed = capital > 0 ? notional / capital * 100 : 0.0
 
-costShare  = close * costPct / 100                          // approx round-trip cost per share
+costShare  = entryPx * costPct / 100                        // approx round-trip cost per share
 netReward  = targetR * riskShare - costShare
 netRiskPS  = riskShare + costShare
 netRR      = netRiskPS > 0 ? netReward / netRiskPS : 0.0
@@ -311,7 +317,7 @@ grossRNeeded = riskShare > 0 ? 2.0 + 3.0 * costShare / riskShare : 0.0  // gross
 // Bursa tick-size sanity: a stop a few ticks away is fiction - one spread
 // crossing stops you out. Tick table: <RM1 = 0.005, RM1-9.99 = 0.01,
 // RM10-99.98 = 0.02, >=RM100 = 0.10.
-tickSize  = close < 1.0 ? 0.005 : close < 10.0 ? 0.01 : close < 100.0 ? 0.02 : 0.10
+tickSize  = entryPx < 1.0 ? 0.005 : entryPx < 10.0 ? 0.01 : entryPx < 100.0 ? 0.02 : 0.10
 stopTicks = tickSize > 0 ? riskShare / tickSize : 0.0
 ticksOK   = stopTicks >= minTicks
 
@@ -320,10 +326,10 @@ ticksOK   = stopTicks >= minTicks
 //   1) Headroom: room to the 52-wk high must cover grossRNeeded
 //      (waived for blue-sky breakouts at/above the prior high - no supply)
 //   2) Volatility realism: target within maxAtrTgt ATRs of price
-targetPx    = close + targetR * riskShare
-headroomR   = riskShare > 0 ? (hi52 - close) / riskShare : 0.0
-blueSky     = close >= hi52 * 0.98
-atrsToTgt   = atrVal > 0 ? (targetPx - close) / atrVal : 0.0
+targetPx    = entryPx + targetR * riskShare
+headroomR   = riskShare > 0 ? (hi52 - entryPx) / riskShare : 0.0
+blueSky     = entryPx >= hi52 * 0.98
+atrsToTgt   = atrVal > 0 ? (targetPx - entryPx) / atrVal : 0.0
 tgtFeasible = atrsToTgt <= maxAtrTgt and (blueSky or headroomR >= grossRNeeded)
 
 // ---------------------------- SIGNALS ----------------------------
@@ -441,9 +447,9 @@ colPanel = color.new(#131722, tableOpac)
 colHdr   = color.new(#2a2e39, tableOpac)
 colLbl   = color.new(#d1d4dc, 0)
 
-var table t = table.new(position.top_right, 2, 32, border_width = 1, border_color = color.new(#434651, 0))
+var table t = table.new(position.top_right, 2, 34, border_width = 1, border_color = color.new(#434651, 0))
 if barstate.islast
-    table.clear(t, 0, 0, 1, 31)
+    table.clear(t, 0, 0, 1, 33)
     r = 0
     table.cell(t, 0, r, "V12 SNIPER", text_color = color.white, bgcolor = color.new(color.black, 0), text_size = size.small)
     table.cell(t, 1, r, verdict, text_color = verdictCol, bgcolor = color.new(color.black, 0), text_size = size.small)
@@ -509,6 +515,9 @@ if barstate.islast
     r += 1
     table.cell(t, 0, r, "- RISK (RM" + str.tostring(capital, "#") + ") -", text_color = color.white, bgcolor = colHdr, text_size = size.small)
     table.cell(t, 1, r, str.tostring(riskUsed, "#.#") + "%" + (autoRisk ? " auto" : "") + " = RM" + str.tostring(capital * riskUsed / 100, "#"), text_color = colLbl, bgcolor = colHdr, text_size = size.small)
+    r += 1
+    table.cell(t, 0, r, "Entry (plan)", text_color = colLbl, bgcolor = colPanel, text_size = size.small)
+    table.cell(t, 1, r, "RM " + str.tostring(entryPx, "#.###") + (tradeMode == "Swing" and not breakout ? " @ pivot break" : " @ market"), text_color = color.new(color.orange, 0), bgcolor = colPanel, text_size = size.small)
     r += 1
     table.cell(t, 0, r, "Stop level", text_color = colLbl, bgcolor = colPanel, text_size = size.small)
     table.cell(t, 1, r, "RM " + str.tostring(stopLvl, "#.###"), text_color = colLbl, bgcolor = colPanel, text_size = size.small)
