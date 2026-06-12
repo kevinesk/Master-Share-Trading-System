@@ -1,1 +1,17 @@
 .claude/
+
+# Python caches
+__pycache__/
+*.pyc
+
+# Secrets (api_key.txt.example stays tracked)
+**/api_key.txt
+**/.env
+
+# Regenerable daily reports - keep signal_journal.csv and fundamentals_*.json
+KLSE Screener/output/watchlist_*.html
+KLSE Screener/output/watchlist_*.csv
+KLSE Screener/output/backtest_*.html
+KLSE Screener/output/backtest_*.csv
+Fundamentals/output/*.html
+NEWS FILTER/*.html
