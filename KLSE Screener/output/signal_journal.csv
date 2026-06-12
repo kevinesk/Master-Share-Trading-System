@@ -1,0 +1,8 @@
+Date,Ticker,Name,Stage,Action,Score,Grade,FundGrade,Price,Pivot,DistPivot%,Imminent,Starter,VolDryUp,Regime,TargetPx,Feasible
+2026-06-11,5285.KL,SDGUTHRIE,COILING,ALERT ONLY — macro bear,78,ELITE,C,6.01,6.15,-2.28,True,False,True,RISK_OFF,,
+2026-06-11,5183.KL,PCHEM,COILING,MONITOR — quality gate,57,B,D,5.8,5.81,-0.17,True,False,True,RISK_OFF,,
+2026-06-11,2445.KL,KLK,BREAKOUT,MONITOR — quality gate,59,B,D,20.8,20.66,0.68,False,False,False,RISK_OFF,,
+2026-06-12,0097.KL,VITROX,BREAKOUT,MONITOR — quality gate,67,A,D,7.26,7.16,1.4,False,False,False,MIXED,,
+2026-06-12,5183.KL,PCHEM,COILING,MONITOR — quality gate,56,B,D,5.38,5.84,-7.88,False,False,True,MIXED,7.415,False
+2026-06-12,1015.KL,AMBANK,COILING,SET ALERT,77,ELITE,C,6.58,6.65,-1.05,True,False,True,MIXED,7.625,True
+2026-06-12,6742.KL,YTLPOWR,COILING,MONITOR — quality gate,63,A,D,4.09,4.25,-3.76,False,False,True,MIXED,5.125,True

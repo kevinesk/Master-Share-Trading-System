@@ -1,0 +1,236 @@
+WEEKEND (Sat/Sun)
+    Screener 1 (VCP Scan)  ──→  Minervini v8 Daily chart review
+    Screener 2 (AI Robot)  ──→  Pro Quant Desk 4H/1H review
+         ↓
+    Build WATCHLIST for the week
+
+DAILY PRE-MARKET (8:30–8:45am)
+    Screener 3 (Momentum)  ──→  Cross-check watchlist vs fresh momentum
+         ↓
+    Shortlist: stocks passing BOTH weekend scan + morning momentum
+
+INTRADAY (9:30am / 11am / 2:30pm)
+    Screener 4 (Intraday)  ──→  From shortlist → Intraday Sniper 5m chart
+         ↓
+    Entry: Only when 5m shows SNIPE signal + VWAP above + PD Levels clear
+
+## Screener Analysis & Improvement Plan
+
+---
+
+## 1. Screener Role Map — How Each Feeds the System
+
+| Screener | When | Feeds Into | Purpose |
+|---|---|---|---|
+| K2 AI Robot with VCP Scan (Weekend) | Sat/Sun | **Minervini VCP v8** (Daily) | Build weekend watchlist of VCP setups |
+| K2 AI Robot (Weekend) | Sat/Sun | **Pro Quant Desk** (4H/1H) | Fundamental + momentum swing candidates |
+| Momentum Scan (8:30–8:45am) | Pre-market daily | **Both swing scripts** | Pre-open shortlist before 9am |
+| Intraday Scan (9:30am / 11am / 2pm) | Live intraday | **Intraday Sniper v7** (5m) | Live execution candidates at key KLSE windows |
+
+---
+
+## 2. Screener 1 — K2 AI Robot with VCP Scan (Weekend)
+
+### Current Issues
+
+| Filter | Issue |
+|---|---|
+| Vol below Avg 30D by **70% or more** | Too aggressive — eliminates most valid KLSE VCP setups. KLSE contraction = 30–50% below avg |
+| Missing SMA(150) > SMA(200) | Minervini **C2** — critical alignment check not in screener |
+| Missing near 52W High | Minervini **C7** requires price > 75% of 52W High — missing entirely |
+| Missing RS vs KLCI | Strategy requires stock outperforming FBMKLCI — no proxy in screener |
+| Mkt cap > 300M | Eliminates valid KLSE mid-cap VCP setups — lower to 150M |
+| "Price above EMA(20) by 0–3%" | Uses EMA(20) — strategy uses EMA(21). Minor but align where possible |
+| No MCDX / smart money proxy | No RSI+MFI bullish zone filter to approximate banker accumulation |
+
+### Improved Filter Set
+
+```
+Market: MY (Malaysia)
+━━━ MINERVINI TREND TEMPLATE (C1–C7) ━━━
+✅ Price > SMA(150)                     ← C1 partial
+✅ Price > SMA(200)                     ← C1 partial
+✅ SMA(50) > SMA(150)                   ← C4
+✅ SMA(50) > SMA(200)                   ← C4
+✅ SMA(150) > SMA(200)     ← ADD THIS   ← C2 (was missing)
+✅ Price > EMA(50)                      ← C5
+✅ SMA(20) 1W > SMA(50) 1W             ← weekly trend
+✅ New High (52W)          ← REPLACE "High" with this  ← C7 proxy
+
+━━━ VCP SQUEEZE CONDITIONS ━━━
+✅ Price above EMA(21) by 0% to 3%     ← tight coil
+✅ Vol below Avg 30D by 30% or more    ← CHANGE from 70% → 30%
+   (volume contraction, not extreme dryup)
+
+━━━ KLSE QUALITY GATES ━━━
+✅ Avg vol 30D > 200K                  ← match strategy min_avg_vol
+✅ Mkt cap > 150M MYR                  ← CHANGE from 300M → 150M
+✅ EPS dil growth, TTM YoY > 0%       ← keep
+✅ Revenue growth, TTM YoY > 0%       ← keep
+✅ Price > 0.50 MYR                   ← ADD — match strategy min_price_rm
+
+━━━ SMART MONEY PROXY ━━━
+✅ RSI(14) 50 to 70                   ← ADD — approximates MCDX bullish zone
+   (not overbought, in momentum zone)
+```
+
+---
+
+## 3. Screener 2 — K2 AI Robot (Weekend)
+
+### Current Issues
+
+| Filter | Issue |
+|---|---|
+| PEG TTM < 1.5 | Eliminates most KLSE high-growth momentum stocks — too restrictive |
+| P/E 0–35 | Misses legitimate growth plays with P/E 35–50 — loosen to 50 |
+| Tech rating: Strong buy | Good alignment — keep |
+| No volume condition | Missing any volume surge or contraction filter |
+| No RSI zone | No momentum quality gate |
+| No ADX | No trend strength filter |
+| Missing SMA(150) > SMA(200) | Same gap as Screener 1 |
+
+### Improved Filter Set
+
+```
+Market: MY (Malaysia)
+━━━ FUNDAMENTAL QUALITY ━━━
+✅ P/E 0 to 50                         ← CHANGE from 35 → 50
+✅ EPS dil growth, TTM YoY > 0%       ← keep
+✅ PEG TTM < 2.5                       ← RELAX from 1.5 → 2.5
+✅ Revenue growth, TTM YoY > 0%       ← ADD
+
+━━━ TREND STRUCTURE ━━━
+✅ Tech rating: Strong buy             ← keep
+✅ SMA(20) 1W > SMA(50) 1W            ← keep
+✅ SMA(50) > SMA(200)                  ← keep
+✅ SMA(150) > SMA(200)    ← ADD THIS  ← C2 alignment
+✅ Price > EMA(50)         ← ADD       ← C5 alignment
+
+━━━ MOMENTUM GATES ━━━
+✅ RSI(14) 50 to 70        ← ADD       ← momentum zone, not overbought
+✅ EMA(9) > EMA(21)        ← ADD       ← short-term bullish crossover
+✅ ADX(14) > 20            ← ADD       ← trend has direction, not ranging
+✅ Vol chg > 20%           ← ADD       ← some volume expansion (not fully dry)
+
+━━━ KLSE GATES ━━━
+✅ Mkt cap > 200M MYR      ← ADD
+✅ Avg vol 30D > 200K      ← ADD
+✅ Price > 0.50 MYR        ← ADD
+```
+
+---
+
+## 4. Screener 3 — Momentum Scan (8:30–8:45am Pre-Market)
+
+### Current Issues
+
+| Filter | Issue |
+|---|---|
+| Price 0.3–20 MYR | Minimum too low — 0.30 allows penny stocks. Change to 0.50 |
+| Mkt cap > 1B MYR | Extremely restrictive for KLSE — eliminates most good mid-cap plays |
+| Missing Price > EMA(200) | No daily trend alignment check |
+| Missing SMA(50) > SMA(200) | No golden cross confirmation |
+| RSI 50–75 | ✅ Good — keep |
+| Vol chg > 50% | ✅ Good — keep for early momentum signal |
+| ADX > 20 | ✅ Good — keep |
+| Rel vol > 1 | ✅ Good — keep |
+| MACD > 0 | ✅ Good — keep |
+| Avg vol 30D > 500K | ✅ Good — raise slightly for intraday quality |
+
+### Improved Filter Set
+
+```
+Market: MY (Malaysia) | Index (Main Market only — no ACE)
+━━━ TREND ALIGNMENT (Daily) ━━━
+✅ Price > EMA(50)                     ← keep
+✅ Price > EMA(200)         ← ADD      ← full Minervini C1/C5 alignment
+✅ SMA(50) > SMA(200)       ← ADD      ← golden cross
+✅ EMA(9) > EMA(21)                    ← keep
+
+━━━ INTRADAY MOMENTUM ━━━
+✅ MACD(12,26) Level > 0               ← keep
+✅ RSI(14) 50 to 75                    ← keep
+✅ ADX(14) > 20                        ← keep
+✅ Vol chg > 50%                       ← keep
+✅ Rel vol > 1                         ← keep
+
+━━━ KLSE QUALITY GATES ━━━
+✅ Avg vol 30D > 500K                  ← keep (good for intraday)
+✅ Price 0.50 to 20 MYR   ← CHANGE min from 0.30 → 0.50
+✅ Mkt cap > 300M MYR     ← CHANGE from 1B → 300M
+✅ EPS dil growth > 0%                 ← keep (fundamental backing)
+```
+
+> **Note:** This 8:30–8:45am scan builds the **pre-open watchlist**. Stocks passing here go into manual review on the Daily + 4H charts (Minervini v8 + Pro Quant Desk) before the 9:30am Intraday Scan.
+
+---
+
+## 5. Screener 4 — Intraday Scan (9:30am / 11:00am / 2:00pm)
+
+### Current Issues
+
+| Filter | Issue |
+|---|---|
+| Vol chg > 200% | Too aggressive — valid breakout bars often show 100–150%. Lower to 100% |
+| Avg vol 30D > 1M | ✅ Correct — high liquidity needed for 5m execution |
+| Rel vol at time > 2 | ✅ Perfect — real-time volume confirmation |
+| Chg > 1.5% | ✅ Good — filters out flat/choppy stocks |
+| VWAP < Price | ✅ Perfect — direct Intraday Sniper alignment |
+| RSI(14) 55–70 | ✅ Good — bullish but not overbought |
+| EMA(20) > EMA(50) | ✅ Good — intraday trend aligned |
+| Missing EMA(9) > EMA(20) | No short-term momentum crossover check |
+| Missing PDH breakout | Price above Previous Day High = key Intraday Sniper gate |
+| Gap % undefined | Should be Gap % > 0 (positive gap signals strength) |
+
+### Improved Filter Set
+
+```
+Market: MY (Malaysia)
+━━━ INTRADAY MOMENTUM GATES ━━━
+✅ Price > 0.50 MYR                    ← keep
+✅ Avg vol 30D > 1M                    ← keep (intraday liquidity)
+✅ Rel vol at time > 2                 ← keep (volume surge NOW)
+✅ Chg > 1.5%                          ← keep (positive day)
+✅ Gap % > 0                ← DEFINE   ← gapping up stocks maintain momentum
+✅ Vol chg > 100%           ← CHANGE from 200% → 100%
+
+━━━ INTRADAY SNIPER ALIGNMENT ━━━
+✅ VWAP < Price                        ← keep ✓ (exact Sniper condition)
+✅ RSI(14) 55 to 70                    ← keep
+✅ EMA(20) > EMA(50)                   ← keep
+✅ EMA(9) > EMA(20)         ← ADD      ← fast momentum crossover
+
+━━━ DAILY TREND ANCHOR ━━━
+✅ Price > EMA(50)          ← ADD      ← daily trend backing
+✅ SMA(50) > SMA(200)       ← ADD      ← golden cross confirmation
+```
+
+> **3 Scan Windows vs KLSE Session:**
+> - **9:30am** — Post opening noise (Sniper filters 9:00–9:30 as noise) ✅ Best window
+> - **11:00am** — Peak morning momentum ✅ Good
+> - **2:00pm** — Post-lunch open (Bursa afternoon session resumes ~2:30pm) ⚠️ Shift to **2:30pm** to avoid the lunch dead zone
+
+---
+
+## 6. Integration Flow — Full System
+
+```
+WEEKEND (Sat/Sun)
+    Screener 1 (VCP Scan)  ──→  Minervini v8 Daily chart review
+    Screener 2 (AI Robot)  ──→  Pro Quant Desk 4H/1H review
+         ↓
+    Build WATCHLIST for the week
+
+DAILY PRE-MARKET (8:30–8:45am)
+    Screener 3 (Momentum)  ──→  Cross-check watchlist vs fresh momentum
+         ↓
+    Shortlist: stocks passing BOTH weekend scan + morning momentum
+
+INTRADAY (9:30am / 11am / 2:30pm)
+    Screener 4 (Intraday)  ──→  From shortlist → Intraday Sniper 5m chart
+         ↓
+    Entry: Only when 5m shows SNIPE signal + VWAP above + PD Levels clear
+```
+
+**The key discipline:** A stock must appear in **Screener 3 AND Screener 4** on the same day to qualify for intraday execution. Screener 4 alone without the daily trend alignment (from Screeners 1/2/3) leads to chasing noise.

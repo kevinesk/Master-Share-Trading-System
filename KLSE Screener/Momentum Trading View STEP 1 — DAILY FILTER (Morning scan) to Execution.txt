@@ -1,0 +1,81 @@
+STEP 1 — DAILY FILTER (Morning scan)
+Check KLSE MSS daily:
+→ Score 8-10 + T1/T2 BUY signal?
+→ YES: Add to watchlist
+→ NO: Skip entirely
+
+STEP 2 — 4H CONTEXT (Mid-morning)
+Check 4H KLSE MSS:
+→ No EXIT-AVOID? RSI 50-70?
+→ YES: Move to Layer 2
+→ NO: Wait, don't trade today
+
+STEP 3 — 1H HUD CHECK
+V6 Single Stock HUD on 1H:
+→ BULLISH + PULLBACK or AT VWAP?
+→ YES: Ready for trigger setup
+→ BELOW VWAP or CHOPPING: Wait more
+
+STEP 4 — 15M TRIGGER SETUP
+Switch to 15M chart:
+→ Wait for V6 Sniper BUY signal
+→ Confirm: Price above orange MA
+→ Confirm: RSI turning up from 50-65
+→ Confirm: SmartMCDX green bars building
+→ Confirm: MACD crossing positive
+→ ALL YES = TRIGGER PULLED ✅
+
+STEP 5 — 5M EXECUTION (Optional precision)
+→ Wait for next 5M BUY signal after 15M trigger
+→ Enter on the BUY arrow candle close
+→ Set stop below nearest PD level
+________________________________________________
+KLSE MSS 15M:   7/10 NEUTRAL    ❌ Below threshold
+HUD 15M:        BELOW VWAP      ❌ Wrong location
+HUD Action:     AVOID           ❌ Do not enter
+Sniper 15M:     EXIT signals firing ❌
+RSI 15M:        59.13 (falling) ⚠️
+MACD 15M:       Negative -0.014 ❌
+SmartMCDX:      Red bars        ❌
+
+TRIGGER CHECKLIST:
+☐ Daily ≥ 8/10 T1/T2     → Partially (NEUTRAL)
+☐ 4H not EXIT-AVOID       → ❌ FAILED
+☐ 1H HUD BULLISH/PULLBACK → ❌ BELOW VWAP
+☐ 15M Sniper BUY signal   → ❌ EXIT signals
+☐ 15M RSI turning up      → ❌ Falling
+☐ 15M above orange MA     → ❌ Below
+
+RESULT: 0/6 checks pass → ABSOLUTE NO ENTRY
+
+_______________________________________________
+DAILY         4H           1H HUD        15M SNIPER
+─────────     ─────────    ──────────    ──────────
+KLSE MSS      KLSE MSS     TREND?        BUY arrow?
+8-10/10?  →   No EXIT?  →  PULLBACK?  →  RSI up?
+T1/T2 BUY?    RSI 50-70?   SETUP READY?  Above MA?
+                                          MACD +?
+    ✅            ✅            ✅            ✅
+                                        → ENTER 🎯
+    
+    ❌ at any step = STOP, don't proceed
+
+________________________________________________
+
+Golden Rules for Using All 3 Together
+
+Rule 1: KLSE MSS Daily is the gatekeeper — if it's NEUTRAL or EXIT, the other tools don't matter. Don't look at the 15M Sniper until Daily approves.
+
+
+Rule 2: The 4H is your early warning system — it will show EXIT-AVOID BEFORE the daily deteriorates. Always check 4H when considering entry.
+
+
+Rule 3: The 15M Sniper BUY signal is only valid if the HUD shows BULLISH + PULLBACK/SETUP READY on the 1H. A BUY arrow during CHOPPING or BELOW VWAP is a trap.
+
+
+Rule 4: Never chase an EXIT signal on 15M. If exits are firing, wait for the full reset — price needs to pull back to VWAP and HUD needs to show PULLBACK again.
+
+
+For VSTECS specifically: Wait for price to pull back to RM5.70–5.85, RSI reset to 60–65 on daily, 4H EXIT-AVOID to clear, then use this full 3-layer system to re-enter cleanly.
+
+

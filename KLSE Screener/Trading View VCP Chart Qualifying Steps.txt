@@ -1,0 +1,99 @@
+
+## Table 1 — Full Signal Qualification Waterfall (Daily → 5m)
+
+Each stage must clear before advancing to the next. A FAIL at any gate means: wait, do not advance.
+
+| Stage | TF | Dashboard | What It Checks | Minimum to Pass | MHC Current | Gate |
+|-------|----|-----------|---------------|-----------------|-------------|------|
+| **1A** | Daily | Minervini v8 | Trend Template (7 conditions) | TPR ≥ 5/7, ideally 7/7 | 7/7 ALL PASS | ✅ |
+| **1B** | Daily | Minervini v8 | FBM KLCI market regime | BULL | BULL | ✅ |
+| **1C** | Daily | Minervini v8 | RS vs KLCI | LEADING | LEADING | ✅ |
+| **1D** | Daily | Minervini v8 | VCP Squeeze | TIGHT or FIRING (for VCP play) | LOOSE | ⚠️ Not VCP |
+| **1E** | Daily | Minervini v8 | BUY SIGNAL | BUY (not SETUP) | BUY | ✅ |
+| **1F** | Daily | MSS v5 | Score | ≥ 8 / 12 | 10 / 12 | ✅ |
+| **1G** | Daily | MSS v5 | KLSE Liquidity (daily avg vol ≥ 200k) | YES | **NO — 157k avg** | ❌ |
+| **1H** | Daily | MSS v5 | SIGNAL | T1 or T2 | NEUTRAL (liq gate) | ❌ |
+| **— STOP —** | | | MHC fails liquidity — do not enter until avg vol crosses 200k | | | |
+| **2A** | 4H | MSS v5 | Score | ≥ 8 / 12 | 10 / 12 | ✅ |
+| **2B** | 4H | MSS v5 | SIGNAL | T1, T2, or NEUTRAL with score ≥ 8 | NEUTRAL (liq gate) | ⚠️ |
+| **2C** | 4H | V7 Pro Desk | Trend D+W | ALIGNED | ALIGNED | ✅ |
+| **2D** | 4H | V7 Pro Desk | RS vs KLCI | LEAD or LEAD+ | LEAD+ | ✅ |
+| **2E** | 4H | V7 Pro Desk | VCP Squeeze | YES (for VCP) / any for momentum | YES | ✅ |
+| **2F** | 4H | V7 Pro Desk | Strike Zone | IN ZONE | IN ZONE | ✅ |
+| **2G** | 4H | V7 Pro Desk | EXECUTE | BUY NOW or SETUP OK | WAIT | ⚠️ |
+| **3A** | 1H | Single Stock HUD | TREND | 6/6 D+W | 6/6 D+W | ✅ |
+| **3B** | 1H | Single Stock HUD | TRUE RS | LEAD or LEAD+ | LEAD+ | ✅ |
+| **3C** | 1H | Single Stock HUD | SETUP | PRIMED or VCP+ | PRIMED | ✅ |
+| **3D** | 1H | Single Stock HUD | LOCATION | ABOVE VWAP or PULLBACK | ABOVE VWAP | ✅ |
+| **3E** | 1H | Single Stock HUD | KLSE | OK (not THIN) | **THIN** | ❌ |
+| **3F** | 1H | Single Stock HUD | ACTION | EXECUTE or SNIPE | SETTING UP | ⚠️ |
+| **3G** | 1H | MSS v5 | Score | ≥ 8 / 12 | 11 / 12 | ✅ |
+| **4A** | 5m | Intraday HUD v7 | DAILY | PASS | PASS | ✅ |
+| **4B** | 5m | Intraday HUD v7 | INTRADAY | BULLISH | BULLISH | ✅ |
+| **4C** | 5m | Intraday HUD v7 | LOCATION | PULLBACK or ABOVE VWAP | PULLBACK | ✅ |
+| **4D** | 5m | Intraday HUD v7 | ACTION | SNIPE or EXECUTE | IN PLAY | ⚠️ |
+| **4E** | 5m | Intraday HUD v7 | Liquidity (KLSE) | OK | **THIN** | ❌ |
+| **4F** | 5m | Intraday HUD v7 | Session | CLEAN | **NOISY** (lunch break) | ❌ |
+| **4G** | 5m | V7 Sniper | Session | CLEAN | **NOISY** | ❌ |
+| **4H** | 5m | V7 Sniper | SIGNAL | SNIPE NOW | WAIT | ❌ |
+| **— DO NOT ENTER —** | | | Session is lunch break. Liquidity insufficient. Wait for 14:30 KLSE reopen + vol improvement | | | |
+
+---
+
+## Table 2 — Dashboard Priority (When Two Are on the Same Chart)
+
+| TF | Dashboard A | Dashboard B | Which is Primary | Why | When to Override |
+|----|------------|------------|-----------------|-----|-----------------|
+| **Daily** | Minervini v8 (left) | MSS v5 (right) | **Minervini v8** | Built specifically for daily swing setup validation — Trend Template, VCP structure, and BUY signal are the strategic green light | Use MSS v5 score to confirm momentum quality. If Minervini = BUY but MSS score < 6, treat as weaker setup |
+| **4H** | MSS v5 (top-right) | V7 Pro Desk (bottom-right) | **V7 Pro Desk** | Strike Zone + EXECUTE/WAIT is the actionable entry decision. MSS v5 gives momentum score context | If V7 Pro Desk = BUY NOW but MSS v5 = NEUTRAL (liquidity fail), do not enter — liquidity gate overrides |
+| **1H** | Single Stock HUD (top-center) | MSS v5 (top-right) | **Single Stock HUD** | PURPOSE-BUILT for 4H/1H timing — SETUP grading, LOCATION, and ACTION are the session entry decision | If HUD = EXECUTE but MSS v5 score < 7, reduce position size — lower confidence |
+| **5m** | Intraday HUD v7 (top-right) | V7 Sniper (bottom-right) | **Both — complementary** | HUD = regime context (MCDX, VWAP, location). Sniper = exact trigger bar (EMA pullback + PD level). Neither can replace the other | The SNIPER SIGNAL column is the actual buy trigger. HUD is the pre-condition reader |
+
+**One absolute override rule:** If **any** script on **any** timeframe shows KLSE Liquidity = **THIN / NO**, do not enter regardless of all other signals. Thin liquidity means wide spreads, slippage, and inability to exit cleanly on bad days.
+
+---
+
+## Table 3 — Which Chart to Use: Trending Momentum Play vs VCP Base Breakout
+
+| Condition | VCP Base Breakout | Trending / High Volume Momentum |
+|-----------|------------------|-------------------------------|
+| **What it looks like** | Price consolidating in tight base, decreasing volume over weeks, then volume spike on breakout | Price in sustained uptrend, consistently high volume, making higher highs |
+| **Minervini v8** | PRIMARY — wait for VCP Squeeze = TIGHT, then BUY SIGNAL = BUY | SECONDARY — use TPR score and RS only. Ignore VCP Squeeze status (will show LOOSE) |
+| **MSS v5 Daily** | Confirmation — T1/T2 signal after breakout | **PRIMARY** — T1 or T2 signal is the main entry gate |
+| **V7 Pro Desk 4H** | Confirmation after breakout | **PRIMARY** — Strike Zone IN ZONE + EXECUTE = BUY NOW is the entry window |
+| **Single Stock HUD 1H** | Entry timing after breakout | **PRIMARY** — ACTION = EXECUTE or SNIPE = optimal entry bar |
+| **Intraday HUD + Sniper 5m** | Exact bar precision entry | **PRIMARY** — SNIPE signal = ideal risk/reward bar |
+| **Key chart for decision** | **Daily** (base structure) | **4H** (trend structure + entry window) |
+| **Entry trigger chart** | **5m** after 1H confirms session | **5m** after 4H confirms Strike Zone |
+| **Stop Loss** | Below base low or ATR 1.5× | Below 4H EMA20 or ATR 1.5× |
+| **Hold target** | Weeks to months | Days to weeks (exit on EMA crossunder) |
+
+---
+
+## Simplified Entry Checklist for a Momentum (Non-VCP) Play
+
+```
+DAILY  — Is it ALIGNED and LEADING?
+  Minervini v8 : TPR ≥ 5/7  +  FBM KLCI BULL  +  RS = LEADING
+  MSS v5       : Score ≥ 8   +  SIGNAL = T1 or T2
+  Liquidity    : Avg daily vol ≥ 200k  ← hard stop if fails
+         ↓ YES to all
+4H     — Is it in the entry window?
+  V7 Pro Desk  : Strike Zone = IN ZONE  +  EXECUTE = BUY NOW
+  MSS v5       : Score ≥ 8  +  ADX passing
+         ↓ YES to all
+1H     — Is this session ready?
+  Single Stock HUD : LOCATION = ABOVE VWAP or PULLBACK
+                     ACTION = EXECUTE or SNIPE
+                     KLSE = OK (not THIN)
+         ↓ YES to all
+5m     — Pull the trigger
+  Intraday HUD : LOCATION = PULLBACK  +  ACTION = SNIPE or EXECUTE
+  V7 Sniper    : Session = CLEAN  +  Regime = BULL
+                 Pullback = QUALITY  +  Volume = SURGE
+                 SIGNAL = SNIPE NOW
+                          ↓
+                       ENTER HERE
+```
+
+For MHC today specifically — the technicals are strong (10–11/12 across all TFs, 7/7 Minervini, RS leading) but **two hard blockers** prevent entry: avg daily volume ~157k (below 200k gate) and the current 14:15 time falls in the KLSE lunch break. The correct action is: watchlist MHC, monitor if daily avg vol builds toward 200k over the next few sessions, then re-evaluate at a clean afternoon session open (14:30–15:00).
