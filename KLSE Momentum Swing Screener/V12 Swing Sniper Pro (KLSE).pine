@@ -1,0 +1,523 @@
+//@version=5
+// =====================================================================
+// V12 SWING SNIPER PRO  -  KLSE Trend + Timing + Risk + Macro/Sector
+// Tier 0: Macro & Sector Drivers (KLCI regime + commodity/FX/rate
+//         tailwind per Bursa sector - CPO, Brent, USD/MYR, US10Y,
+//         SOX, aluminium, nat gas). Mapping per KB 03/16/32.
+// Tier 1: Trend Quality gates (Minervini Trend Template, RS vs KLCI, OBV)
+// Tier 2: Entry Timing gates (extension, pullback, coil, RSI, pivot break)
+// Tier 3: Risk Panel (stop, board-lot sizing, notional cap, net R:R,
+//         liquidity floor, tick-size sanity)
+// V12 fixes vs V11:
+//   - BUY no longer fires when target is infeasible (was: verdict said
+//     WATCH but the triangle + alert still fired)
+//   - Coil gate measured on PRIOR bar (breakout bar's own range was
+//     inflating ATR5 and vetoing valid breakouts)
+//   - Pullback proximity now compares each bar's low to that bar's EMA20
+//     (was: past lows vs today's EMA level)
+//   - New liquidity floor (avg RM value/day) - illiquid names blocked
+//   - Stop distance shown in Bursa ticks - flags untradeable tight stops
+//   - KLCI regime is a 5-tier RISK SCALER (2/1.5/1/0.5/0% per
+//     KLSE_MASTER_SYSTEM section 6) - only BEAR/CRISIS block entries
+//   - EMA20 (Minervini) stop is the default; PAM / swing / ATR remain
+//     options; stops wider than the max-stop % cap block the BUY
+//   - Stop / target / pivot levels drawn on the chart; table is compact
+//     by default (toggle "show gate detail rows" for full diagnostics)
+// Notes: every table.cell on its own line; no multi-line ternaries.
+// =====================================================================
+indicator("V12 Swing Sniper Pro", shorttitle = "V12 Sniper", overlay = true, calc_bars_count = 500)
+
+// ---------------------------- INPUTS ----------------------------
+grpMode    = "Mode"
+tradeMode  = input.string("Swing", "Trade mode", options = ["Swing", "Trend"], group = grpMode)
+
+grpMacro   = "Tier 0 - Macro & Sector Drivers"
+macroMode  = input.string("Hard", "Macro gate mode", options = ["Hard", "Warn", "Off"], group = grpMacro, tooltip = "Hard: KLCI bear/crisis regime or sector commodity headwind blocks BUY. Warn: shows caution but BUY still fires. Off: display only.")
+sector     = input.string("None / Other", "Stock sector", options = ["Banking", "Technology", "Plantation", "Oil & Gas", "Gloves", "Healthcare", "REITs", "Property", "Construction", "Consumer", "Industrial (Metals)", "Utilities", "Telecom", "None / Other"], group = grpMacro, tooltip = "Set per chart. Drives which commodity/FX/rate series gates this stock.")
+symCPO     = input.symbol("MYX:FCPO1!",    "Crude palm oil (FCPO)", group = grpMacro)
+symOIL     = input.symbol("TVC:UKOIL",     "Brent crude",           group = grpMacro)
+symFX      = input.symbol("FX_IDC:USDMYR", "USD/MYR",               group = grpMacro)
+symYLD     = input.symbol("TVC:US10Y",     "US 10Y yield",          group = grpMacro)
+symSOX     = input.symbol("NASDAQ:SOX",    "Semiconductor index",   group = grpMacro)
+symALU     = input.symbol("COMEX:ALI1!",   "Aluminium",             group = grpMacro)
+symGAS     = input.symbol("NYMEX:NG1!",    "Natural gas",           group = grpMacro)
+
+grpTrend   = "Tier 1 - Trend Quality"
+rsSymbol   = input.symbol("FTSEMYX:FBMKLCI", "RS benchmark (KLCI)", group = grpTrend)
+nearHiPct  = input.float(25.0, "Max % below 52-wk high", group = grpTrend)
+aboveLoPct = input.float(30.0, "Min % above 52-wk low",  group = grpTrend)
+
+grpTime    = "Tier 2 - Entry Timing"
+emaFastLen = input.int(9,     "Fast EMA",                          group = grpTime)
+emaPbLen   = input.int(20,    "Pullback EMA",                      group = grpTime)
+atrLen     = input.int(14,    "ATR length",                        group = grpTime)
+maxExtATR  = input.float(4.0, "Max extension (ATR above pullback EMA)", group = grpTime)
+maxPctFast = input.float(8.0, "Max % above fast EMA",              group = grpTime)
+proxBandPct= input.float(3.0, "Pullback proximity band %",         group = grpTime)
+pbLookback = input.int(10,    "Pullback lookback (bars)",          group = grpTime)
+coilRatio  = input.float(0.70,"Coil: ATR5/ATR20 must be below",    group = grpTime)
+rsiHardCap = input.float(80.0,"RSI hard block",                    group = grpTime)
+pivotLen   = input.int(20,    "Pivot lookback (bars)",             group = grpTime)
+volMult    = input.float(1.5, "Breakout volume multiple",          group = grpTime)
+
+grpRisk    = "Tier 3 - Risk Panel"
+capital    = input.float(30000.0, "Capital (RM)",                     group = grpRisk)
+riskPct    = input.float(1.0,     "Manual risk per trade % (if auto off)", group = grpRisk)
+autoRisk   = input.bool(true,     "Auto risk % by KLCI regime (2/1.5/1/0.5/0)", group = grpRisk)
+notionalCapPct = input.float(25.0,"Max notional per position %",      group = grpRisk)
+stopLook   = input.int(10,        "Stop: swing-low lookback (bars)",  group = grpRisk)
+stopBufPct = input.float(1.0,     "Stop buffer below ref level %",    group = grpRisk)
+targetR    = input.float(2.5,     "Target (gross R multiple)",        group = grpRisk)
+costPct    = input.float(0.70,    "Round-trip cost % of notional (VERIFY with broker)", group = grpRisk)
+stopMode   = input.string("EMA20 (Minervini)", "Stop construction", options = ["EMA20 (Minervini)", "PAM (swing - ATR offset)", "Swing low", "ATR", "Tighter"], group = grpRisk)
+pamMult    = input.float(0.7,     "PAM ATR-offset multiple",          group = grpRisk)
+maxStopPct = input.float(8.0,     "Max stop distance % (Minervini cap)", group = grpRisk)
+atrStopMult= input.float(1.5,     "ATR stop multiple (ATR mode)",     group = grpRisk)
+maxAtrTgt  = input.float(10.0,    "Max ATRs to target (feasibility)", group = grpRisk)
+requireFeas= input.bool(true,     "BUY requires feasible target",     group = grpRisk)
+minValRM   = input.float(500000.0,"Min avg traded value RM/day (20-bar)", group = grpRisk)
+minTicks   = input.float(8.0,     "Min stop distance (Bursa ticks)",  group = grpRisk)
+
+grpUx      = "Display"
+showMAs    = input.bool(true, "Plot moving averages", group = grpUx)
+showLevels = input.bool(true, "Draw stop/target/pivot levels on chart", group = grpUx)
+showDetail = input.bool(false, "Table: show gate detail rows", group = grpUx)
+tableOpac  = input.int(0, "Table background transparency (0 = solid)", minval = 0, maxval = 60, group = grpUx)
+
+// ---------------------------- TIER 0 : MACRO & SECTOR DRIVERS ----------------------------
+// Driver trend score on DAILY bars: +1 uptrend (close > EMA50 and EMA50
+// rising over 10 bars), -1 downtrend, 0 flat or data unavailable.
+// ignore_invalid_symbol=true degrades gracefully: missing feed = neutral.
+f_drv(sym) =>
+    [c, e50, e50p] = request.security(sym, "D", [close, ta.ema(close, 50), ta.ema(close, 50)[10]], lookahead = barmerge.lookahead_off, ignore_invalid_symbol = true)
+    ok = not na(c) and not na(e50) and not na(e50p)
+    sc = not ok ? 0 : c > e50 and e50 > e50p ? 1 : c < e50 and e50 < e50p ? -1 : 0
+    [sc, ok]
+
+[scCPO, okCPO] = f_drv(symCPO)
+[scOIL, okOIL] = f_drv(symOIL)
+[scFX,  okFX ] = f_drv(symFX)
+[scYLD, okYLD] = f_drv(symYLD)
+[scSOX, okSOX] = f_drv(symSOX)
+[scALU, okALU] = f_drv(symALU)
+[scGAS, okGAS] = f_drv(symGAS)
+
+// KLCI market regime (daily), 5 tiers mapped to risk % per
+// KLSE_MASTER_SYSTEM section 6 (dynamic 1%/2% rule):
+//   STRONG BULL  close > EMA50 > EMA200, EMA50 rising  -> 2.0%
+//   NEUTRAL      close above both, stack imperfect     -> 1.5%
+//   WEAK         below EMA50, above EMA200             -> 1.0%
+//   BEAR         below EMA200, EMA50 still above       -> 0.5% (capitulation only -> blocks breakout buys)
+//   CRISIS       below EMA200 and EMA50 < EMA200       -> 0.0% (no new entries)
+[kC, kE50, kE200, kE50p] = request.security(rsSymbol, "D", [close, ta.ema(close, 50), ta.ema(close, 200), ta.ema(close, 50)[10]], lookahead = barmerge.lookahead_off, ignore_invalid_symbol = true)
+kData      = not na(kC) and not na(kE50) and not na(kE200) and not na(kE50p)
+rgStrong   = kData and kC > kE50 and kE50 > kE200 and kE50 > kE50p
+rgNeutral  = kData and not rgStrong and kC > kE50 and kC > kE200
+rgWeak     = kData and not rgStrong and not rgNeutral and kC > kE200
+rgCrisis   = kData and kC <= kE200 and kE50 < kE200
+rgBear     = kData and kC <= kE200 and not rgCrisis
+regimeRed  = rgBear or rgCrisis
+regimeTxt  = not kData ? "n/a - check symbol" : rgStrong ? "STRONG BULL" : rgNeutral ? "NEUTRAL" : rgWeak ? "WEAK" : rgCrisis ? "CRISIS" : "BEAR"
+regimeRisk = not kData ? riskPct : rgStrong ? 2.0 : rgNeutral ? 1.5 : rgWeak ? 1.0 : rgCrisis ? 0.0 : 0.5
+riskUsed   = autoRisk ? regimeRisk : riskPct
+
+// Sector -> driver mapping (signed: positive score = tailwind for sector).
+// Per KB 03: weak MYR (USDMYR up) helps exporters (tech/gloves/plantation/
+// healthcare tourism); strong MYR helps consumer + foreign flows to banks;
+// falling US10Y helps REITs/property/construction/telecom/utilities;
+// CPO drives plantation, Brent drives O&G, SOX drives tech, aluminium
+// drives metal industrials, nat gas is a COST for utilities (inverted).
+d1Name = "-"
+d1Sc   = 0
+d1Ok   = true
+d2Name = "-"
+d2Sc   = 0
+d2Ok   = true
+if sector == "Plantation"
+    d1Name := "CPO trend"
+    d1Sc   := scCPO
+    d1Ok   := okCPO
+    d2Name := "USD/MYR up (weak MYR)"
+    d2Sc   := scFX
+    d2Ok   := okFX
+else if sector == "Technology"
+    d1Name := "SOX semis trend"
+    d1Sc   := scSOX
+    d1Ok   := okSOX
+    d2Name := "USD/MYR up (weak MYR)"
+    d2Sc   := scFX
+    d2Ok   := okFX
+else if sector == "Oil & Gas"
+    d1Name := "Brent crude trend"
+    d1Sc   := scOIL
+    d1Ok   := okOIL
+else if sector == "Banking"
+    d1Name := "US10Y rising (NIM)"
+    d1Sc   := scYLD
+    d1Ok   := okYLD
+    d2Name := "MYR strength (flows)"
+    d2Sc   := -scFX
+    d2Ok   := okFX
+else if sector == "Gloves"
+    d1Name := "USD/MYR up (weak MYR)"
+    d1Sc   := scFX
+    d1Ok   := okFX
+else if sector == "Healthcare"
+    d1Name := "USD/MYR up (med tourism)"
+    d1Sc   := scFX
+    d1Ok   := okFX
+else if sector == "REITs"
+    d1Name := "US10Y falling"
+    d1Sc   := -scYLD
+    d1Ok   := okYLD
+else if sector == "Property"
+    d1Name := "US10Y falling"
+    d1Sc   := -scYLD
+    d1Ok   := okYLD
+else if sector == "Construction"
+    d1Name := "US10Y falling"
+    d1Sc   := -scYLD
+    d1Ok   := okYLD
+else if sector == "Consumer"
+    d1Name := "MYR strength (imports)"
+    d1Sc   := -scFX
+    d1Ok   := okFX
+else if sector == "Industrial (Metals)"
+    d1Name := "Aluminium trend"
+    d1Sc   := scALU
+    d1Ok   := okALU
+    d2Name := "USD/MYR up (exports)"
+    d2Sc   := scFX
+    d2Ok   := okFX
+else if sector == "Utilities"
+    d1Name := "Nat gas falling (cost)"
+    d1Sc   := -scGAS
+    d1Ok   := okGAS
+    d2Name := "US10Y falling (yield play)"
+    d2Sc   := -scYLD
+    d2Ok   := okYLD
+else if sector == "Telecom"
+    d1Name := "US10Y falling (yield play)"
+    d1Sc   := -scYLD
+    d1Ok   := okYLD
+
+secScore = d1Sc + d2Sc
+secState = secScore > 0 ? 1 : secScore < 0 ? -1 : 0
+
+macroHard   = macroMode == "Hard"
+macroBlock  = macroHard and (regimeRed or secState < 0)
+macroWarnOn = macroMode == "Warn" and (regimeRed or secState < 0)
+
+// ---------------------------- TIER 1 : TREND QUALITY ----------------------------
+sma50  = ta.sma(close, 50)
+sma150 = ta.sma(close, 150)
+sma200 = ta.sma(close, 200)
+hi52   = ta.highest(high, 252)
+lo52   = ta.lowest(low, 252)
+
+klciClose = request.security(rsSymbol, timeframe.period, close, lookahead = barmerge.lookahead_off, ignore_invalid_symbol = true)
+rsLine    = klciClose > 0 ? close / klciClose : na
+rsSma     = ta.sma(rsLine, 21)
+
+obvVal = ta.obv
+obvSma = ta.sma(obvVal, 20)
+
+g1_stack   = close > sma50 and sma50 > sma150 and sma150 > sma200
+g2_smaRise = sma200 > sma200[21]
+g3_nearHi  = close >= hi52 * (1 - nearHiPct / 100)
+g4_aboveLo = close >= lo52 * (1 + aboveLoPct / 100)
+g5_rs      = not na(rsLine) and rsLine > rsSma
+g6_obv     = obvVal > obvSma
+
+trendCount = (g1_stack ? 1 : 0) + (g2_smaRise ? 1 : 0) + (g3_nearHi ? 1 : 0) + (g4_aboveLo ? 1 : 0) + (g5_rs ? 1 : 0) + (g6_obv ? 1 : 0)
+trendOK    = trendCount == 6
+
+// Liquidity floor: 20-bar average traded value. Illiquid names spoof the
+// risk model (you cannot exit 25 lots into a 3-lot bid).
+valueSma = ta.sma(close * volume, 20)
+liqOK    = valueSma >= minValRM
+
+// ---------------------------- TIER 2 : ENTRY TIMING ----------------------------
+emaFast  = ta.ema(close, emaFastLen)
+emaPb    = ta.ema(close, emaPbLen)
+atrVal   = ta.atr(atrLen)
+rsiVal   = ta.rsi(close, 14)
+atrShort = ta.atr(5)
+atrLong  = ta.atr(20)
+volSma   = ta.sma(volume, 20)
+
+extATR  = atrVal > 0 ? (close - emaPb) / atrVal : 0.0
+pctFast = emaFast > 0 ? (close - emaFast) / emaFast * 100 : 0.0
+
+t1_notExtended = extATR <= maxExtATR and pctFast <= maxPctFast
+
+// V12 fix: bar-by-bar touch of EMA20 band, then "how long ago" - past lows
+// are compared to the EMA as it was THEN, not today's EMA level.
+nearTouch  = low <= emaPb * (1 + proxBandPct / 100)
+sinceTouch = ta.barssince(nearTouch)
+t2_nearEma = not na(sinceTouch) and sinceTouch <= pbLookback
+
+// V12 fix: coil measured on the PRIOR bar. A wide breakout bar inflates
+// ATR5 on the signal bar itself and would veto the very setup we hunt.
+coilPrev     = atrLong[1] > 0 ? atrShort[1] / atrLong[1] : na
+t3_coilTight = not na(coilPrev) and coilPrev < coilRatio
+
+t4_rsiOk = rsiVal < rsiHardCap
+
+entryTimingOK = t1_notExtended and t2_nearEma and t3_coilTight and t4_rsiOk
+
+pivotHigh  = ta.highest(high[1], pivotLen)
+volConfirm = volume > volSma * volMult
+breakout   = close > pivotHigh and volConfirm
+
+// Trend-mode entry: controlled pullback to a rising 50 SMA
+sma50Rising = sma50 > sma50[5]
+pullback50  = low <= sma50 * (1 + proxBandPct / 100) and close > sma50 and sma50Rising and rsiVal < 70.0
+
+// ---------------------------- TIER 3 : RISK PANEL ----------------------------
+stopSwing = ta.lowest(low, stopLook) * (1 - stopBufPct / 100)
+stopAtrLv = close - atrStopMult * atrVal
+stopPam   = ta.lowest(low, stopLook) - pamMult * atrVal
+stopEma   = emaPb * (1 - stopBufPct / 100)
+stopLvl   = stopMode == "EMA20 (Minervini)" ? stopEma : stopMode == "PAM (swing - ATR offset)" ? stopPam : stopMode == "Swing low" ? stopSwing : stopMode == "ATR" ? stopAtrLv : math.max(stopSwing, stopAtrLv)
+riskShare = close - stopLvl
+
+// Minervini stop-width sanity: reject setups needing a stop wider than
+// maxStopPct, and reject a stop reference sitting above price entirely
+stopPctW  = close > 0 ? riskShare / close * 100 : 0.0
+stopOK    = riskShare > 0 and stopPctW <= maxStopPct
+
+lotsByRisk = riskShare > 0 ? math.floor(capital * riskUsed / 100 / riskShare / 100) : 0
+lotsByCap  = close > 0 ? math.floor(capital * notionalCapPct / 100 / (close * 100)) : 0
+lots       = math.max(0, math.min(lotsByRisk, lotsByCap))
+shares     = lots * 100
+notional   = shares * close
+riskRM     = shares * riskShare
+notionalPctUsed = capital > 0 ? notional / capital * 100 : 0.0
+
+costShare  = close * costPct / 100                          // approx round-trip cost per share
+netReward  = targetR * riskShare - costShare
+netRiskPS  = riskShare + costShare
+netRR      = netRiskPS > 0 ? netReward / netRiskPS : 0.0
+grossRNeeded = riskShare > 0 ? 2.0 + 3.0 * costShare / riskShare : 0.0  // gross R for 1:2 NET
+
+// Bursa tick-size sanity: a stop a few ticks away is fiction - one spread
+// crossing stops you out. Tick table: <RM1 = 0.005, RM1-9.99 = 0.01,
+// RM10-99.98 = 0.02, >=RM100 = 0.10.
+tickSize  = close < 1.0 ? 0.005 : close < 10.0 ? 0.01 : close < 100.0 ? 0.02 : 0.10
+stopTicks = tickSize > 0 ? riskShare / tickSize : 0.0
+ticksOK   = stopTicks >= minTicks
+
+// Reward feasibility - risk math means nothing if the market structure
+// cannot plausibly deliver the target. Two tests:
+//   1) Headroom: room to the 52-wk high must cover grossRNeeded
+//      (waived for blue-sky breakouts at/above the prior high - no supply)
+//   2) Volatility realism: target within maxAtrTgt ATRs of price
+targetPx    = close + targetR * riskShare
+headroomR   = riskShare > 0 ? (hi52 - close) / riskShare : 0.0
+blueSky     = close >= hi52 * 0.98
+atrsToTgt   = atrVal > 0 ? (targetPx - close) / atrVal : 0.0
+tgtFeasible = atrsToTgt <= maxAtrTgt and (blueSky or headroomR >= grossRNeeded)
+
+// ---------------------------- SIGNALS ----------------------------
+// V12 fix: BUY now respects feasibility (optional), liquidity and the
+// macro gate - V11 fired the alert even when the verdict said WATCH.
+feasOK = not requireFeas or tgtFeasible
+
+swingBuySignal = trendOK and entryTimingOK and breakout and feasOK and liqOK and stopOK and not macroBlock
+trendBuySignal = trendOK and pullback50 and feasOK and liqOK and stopOK and not macroBlock
+buySignal      = tradeMode == "Swing" ? swingBuySignal : trendBuySignal
+
+// ---------------------------- VERDICT ----------------------------
+verdict    = "BUY SETUP - verify live depth"
+verdictCol = color.lime
+if macroHard and regimeRed
+    verdict    := "STAND DOWN - KLCI " + (rgCrisis ? "crisis" : "bear") + " regime"
+    verdictCol := color.red
+else if macroHard and secState < 0
+    verdict    := "AVOID - sector driver headwind"
+    verdictCol := color.red
+else if not trendOK
+    verdict    := "AVOID - trend gates fail (" + str.tostring(trendCount) + "/6)"
+    verdictCol := color.red
+else if not liqOK
+    verdict    := "AVOID - illiquid (value/day below floor)"
+    verdictCol := color.red
+else if not stopOK
+    verdict    := "WATCH - stop invalid or wider than " + str.tostring(maxStopPct, "#") + "%"
+    verdictCol := color.orange
+else if tradeMode == "Swing" and not entryTimingOK
+    verdict    := "WATCH - timing blocked"
+    verdictCol := color.orange
+else if tradeMode == "Swing" and not breakout
+    verdict    := "READY - await pivot break + volume"
+    verdictCol := color.yellow
+else if tradeMode == "Trend" and not pullback50
+    verdict    := "HOLD ZONE - await 50-SMA pullback"
+    verdictCol := color.yellow
+else if requireFeas and not tgtFeasible
+    verdict    := "WATCH - target infeasible"
+    verdictCol := color.orange
+else if macroWarnOn
+    verdict    := "BUY (CAUTION) - macro warn"
+    verdictCol := color.yellow
+
+// ---------------------------- PLOTS & MARKERS ----------------------------
+plot(showMAs ? sma50  : na, "SMA 50",  color = color.orange)
+plot(showMAs ? sma150 : na, "SMA 150", color = color.aqua)
+plot(showMAs ? sma200 : na, "SMA 200", color = color.red)
+plot(showMAs ? emaPb  : na, "EMA 20",  color = color.new(color.blue, 30))
+
+plotshape(buySignal, title = "BUY", style = shape.triangleup, location = location.belowbar, color = color.lime, size = size.small, text = "BUY")
+plotshape(trendOK and not t1_notExtended, title = "Extended", style = shape.xcross, location = location.abovebar, color = color.orange, size = size.tiny)
+
+// ---------------------------- TRADE PLAN LEVELS ----------------------------
+// Stop / target / pivot drawn at the right edge whenever Tier 1 passes,
+// so the trade plan is readable even if the table is cut off or hidden.
+var line  lnStop = na
+var line  lnTgt  = na
+var line  lnPvt  = na
+var label lbStop = na
+var label lbTgt  = na
+var label lbPvt  = na
+if barstate.islast
+    line.delete(lnStop)
+    line.delete(lnTgt)
+    line.delete(lnPvt)
+    label.delete(lbStop)
+    label.delete(lbTgt)
+    label.delete(lbPvt)
+    if showLevels and trendOK
+        lnStop := line.new(bar_index - 1, stopLvl, bar_index + 10, stopLvl, color = color.red, width = 2)
+        lnTgt  := line.new(bar_index - 1, targetPx, bar_index + 10, targetPx, color = color.lime, width = 2)
+        lnPvt  := line.new(bar_index - 1, pivotHigh, bar_index + 10, pivotHigh, color = color.yellow, style = line.style_dashed, width = 1)
+        lbStop := label.new(bar_index + 10, stopLvl, "STOP RM " + str.tostring(stopLvl, "#.###") + " (-" + str.tostring(stopPctW, "#.#") + "%)", style = label.style_label_left, color = color.new(color.red, 70), textcolor = color.white, size = size.small)
+        lbTgt  := label.new(bar_index + 10, targetPx, "TARGET RM " + str.tostring(targetPx, "#.###") + " (" + str.tostring(targetR, "#.#") + "R)", style = label.style_label_left, color = color.new(color.green, 70), textcolor = color.white, size = size.small)
+        lbPvt  := label.new(bar_index + 10, pivotHigh, "PIVOT RM " + str.tostring(pivotHigh, "#.###"), style = label.style_label_left, color = color.new(color.gray, 60), textcolor = color.yellow, size = size.small)
+
+// ---------------------------- ALERTS ----------------------------
+alertcondition(swingBuySignal, title = "V12 Swing breakout", message = "V12: VCP pivot breakout with volume, macro + liquidity + feasibility clear - verify chart, depth and risk panel before entry.")
+alertcondition(trendBuySignal, title = "V12 Trend pullback", message = "V12: Pullback to rising 50-SMA in qualified uptrend - verify before entry.")
+alertcondition(trendOK[1] and not trendOK, title = "V12 Trend deterioration", message = "V12: A trend-quality gate just failed - review open position.")
+alertcondition(secState < 0 and secState[1] >= 0, title = "V12 Sector headwind", message = "V12: Sector commodity/FX/rate driver flipped to headwind - review open positions in this sector.")
+alertcondition(regimeRed and not regimeRed[1], title = "V12 KLCI regime red", message = "V12: KLCI regime dropped to BEAR/CRISIS - no new breakout entries, tighten stops on open positions.")
+
+// ---------------------------- DASHBOARD TABLE ----------------------------
+f_txt(b) =>
+    b ? "PASS" : "FAIL"
+f_col(b) =>
+    b ? color.lime : color.red
+f_drvTxt(sc, ok) =>
+    not ok ? "n/a - check symbol" : sc > 0 ? "TAILWIND" : sc < 0 ? "HEADWIND" : "NEUTRAL"
+f_drvCol(sc, ok) =>
+    not ok ? color.gray : sc > 0 ? color.lime : sc < 0 ? color.red : color.orange
+
+secTxt = secState > 0 ? "TAILWIND" : secState < 0 ? "HEADWIND" : "NEUTRAL"
+secCol = secState > 0 ? color.lime : secState < 0 ? color.red : color.orange
+
+colPanel = color.new(#131722, tableOpac)
+colHdr   = color.new(#2a2e39, tableOpac)
+colLbl   = color.new(#d1d4dc, 0)
+
+var table t = table.new(position.top_right, 2, 32, border_width = 1, border_color = color.new(#434651, 0))
+if barstate.islast
+    table.clear(t, 0, 0, 1, 31)
+    r = 0
+    table.cell(t, 0, r, "V12 SNIPER", text_color = color.white, bgcolor = color.new(color.black, 0), text_size = size.small)
+    table.cell(t, 1, r, verdict, text_color = verdictCol, bgcolor = color.new(color.black, 0), text_size = size.small)
+    r += 1
+    table.cell(t, 0, r, "Mode", text_color = colLbl, bgcolor = colPanel, text_size = size.small)
+    table.cell(t, 1, r, tradeMode, text_color = colLbl, bgcolor = colPanel, text_size = size.small)
+    r += 1
+    table.cell(t, 0, r, "- MACRO / SECTOR (" + macroMode + ") -", text_color = color.white, bgcolor = colHdr, text_size = size.small)
+    table.cell(t, 1, r, secTxt, text_color = secCol, bgcolor = colHdr, text_size = size.small)
+    r += 1
+    table.cell(t, 0, r, "KLCI regime (risk scaler)", text_color = colLbl, bgcolor = colPanel, text_size = size.small)
+    table.cell(t, 1, r, regimeTxt, text_color = not kData ? color.gray : rgStrong ? color.lime : rgNeutral ? color.green : rgWeak ? color.orange : color.red, bgcolor = colPanel, text_size = size.small)
+    r += 1
+    table.cell(t, 0, r, "Sector", text_color = colLbl, bgcolor = colPanel, text_size = size.small)
+    table.cell(t, 1, r, sector, text_color = colLbl, bgcolor = colPanel, text_size = size.small)
+    r += 1
+    table.cell(t, 0, r, "Driver 1: " + d1Name, text_color = colLbl, bgcolor = colPanel, text_size = size.small)
+    table.cell(t, 1, r, f_drvTxt(d1Sc, d1Ok), text_color = f_drvCol(d1Sc, d1Ok), bgcolor = colPanel, text_size = size.small)
+    r += 1
+    table.cell(t, 0, r, "Driver 2: " + d2Name, text_color = colLbl, bgcolor = colPanel, text_size = size.small)
+    table.cell(t, 1, r, f_drvTxt(d2Sc, d2Ok), text_color = f_drvCol(d2Sc, d2Ok), bgcolor = colPanel, text_size = size.small)
+    r += 1
+    table.cell(t, 0, r, "- TREND -", text_color = color.white, bgcolor = colHdr, text_size = size.small)
+    table.cell(t, 1, r, str.tostring(trendCount) + "/6", text_color = f_col(trendOK), bgcolor = colHdr, text_size = size.small)
+    r += 1
+    if showDetail
+        table.cell(t, 0, r, "MA stack 50>150>200", text_color = colLbl, bgcolor = colPanel, text_size = size.small)
+        table.cell(t, 1, r, f_txt(g1_stack), text_color = f_col(g1_stack), bgcolor = colPanel, text_size = size.small)
+        r += 1
+        table.cell(t, 0, r, "200-SMA rising", text_color = colLbl, bgcolor = colPanel, text_size = size.small)
+        table.cell(t, 1, r, f_txt(g2_smaRise), text_color = f_col(g2_smaRise), bgcolor = colPanel, text_size = size.small)
+        r += 1
+        table.cell(t, 0, r, "Near 52-wk high", text_color = colLbl, bgcolor = colPanel, text_size = size.small)
+        table.cell(t, 1, r, f_txt(g3_nearHi), text_color = f_col(g3_nearHi), bgcolor = colPanel, text_size = size.small)
+        r += 1
+        table.cell(t, 0, r, "Above 52-wk low", text_color = colLbl, bgcolor = colPanel, text_size = size.small)
+        table.cell(t, 1, r, f_txt(g4_aboveLo), text_color = f_col(g4_aboveLo), bgcolor = colPanel, text_size = size.small)
+        r += 1
+        table.cell(t, 0, r, "RS vs KLCI", text_color = colLbl, bgcolor = colPanel, text_size = size.small)
+        table.cell(t, 1, r, f_txt(g5_rs), text_color = f_col(g5_rs), bgcolor = colPanel, text_size = size.small)
+        r += 1
+        table.cell(t, 0, r, "OBV accumulation", text_color = colLbl, bgcolor = colPanel, text_size = size.small)
+        table.cell(t, 1, r, f_txt(g6_obv), text_color = f_col(g6_obv), bgcolor = colPanel, text_size = size.small)
+        r += 1
+    table.cell(t, 0, r, "- TIMING -", text_color = color.white, bgcolor = colHdr, text_size = size.small)
+    table.cell(t, 1, r, f_txt(entryTimingOK), text_color = f_col(entryTimingOK), bgcolor = colHdr, text_size = size.small)
+    r += 1
+    if showDetail
+        table.cell(t, 0, r, "Ext (ATR / %fast)", text_color = colLbl, bgcolor = colPanel, text_size = size.small)
+        table.cell(t, 1, r, str.tostring(extATR, "#.##") + " / " + str.tostring(pctFast, "#.#") + "%", text_color = f_col(t1_notExtended), bgcolor = colPanel, text_size = size.small)
+        r += 1
+        table.cell(t, 0, r, "Near EMA20 recently", text_color = colLbl, bgcolor = colPanel, text_size = size.small)
+        table.cell(t, 1, r, f_txt(t2_nearEma), text_color = f_col(t2_nearEma), bgcolor = colPanel, text_size = size.small)
+        r += 1
+        table.cell(t, 0, r, "Coil ATR5/ATR20 (prior bar)", text_color = colLbl, bgcolor = colPanel, text_size = size.small)
+        table.cell(t, 1, r, str.tostring(na(coilPrev) ? 0.0 : coilPrev, "#.##"), text_color = f_col(t3_coilTight), bgcolor = colPanel, text_size = size.small)
+        r += 1
+        table.cell(t, 0, r, "RSI(14)", text_color = colLbl, bgcolor = colPanel, text_size = size.small)
+        table.cell(t, 1, r, str.tostring(rsiVal, "#.#"), text_color = f_col(t4_rsiOk), bgcolor = colPanel, text_size = size.small)
+        r += 1
+    table.cell(t, 0, r, "Pivot break + vol", text_color = colLbl, bgcolor = colPanel, text_size = size.small)
+    table.cell(t, 1, r, breakout ? "YES" : "NO", text_color = f_col(breakout), bgcolor = colPanel, text_size = size.small)
+    r += 1
+    table.cell(t, 0, r, "- RISK (RM" + str.tostring(capital, "#") + ") -", text_color = color.white, bgcolor = colHdr, text_size = size.small)
+    table.cell(t, 1, r, str.tostring(riskUsed, "#.#") + "%" + (autoRisk ? " auto" : "") + " = RM" + str.tostring(capital * riskUsed / 100, "#"), text_color = colLbl, bgcolor = colHdr, text_size = size.small)
+    r += 1
+    table.cell(t, 0, r, "Stop level", text_color = colLbl, bgcolor = colPanel, text_size = size.small)
+    table.cell(t, 1, r, "RM " + str.tostring(stopLvl, "#.###"), text_color = colLbl, bgcolor = colPanel, text_size = size.small)
+    r += 1
+    table.cell(t, 0, r, "Stop distance", text_color = colLbl, bgcolor = colPanel, text_size = size.small)
+    table.cell(t, 1, r, str.tostring(stopPctW, "#.#") + "% (cap " + str.tostring(maxStopPct, "#") + "%)", text_color = f_col(stopOK), bgcolor = colPanel, text_size = size.small)
+    r += 1
+    table.cell(t, 0, r, "Risk / share", text_color = colLbl, bgcolor = colPanel, text_size = size.small)
+    table.cell(t, 1, r, "RM " + str.tostring(riskShare, "#.###") + " (" + str.tostring(stopTicks, "#.#") + " ticks)", text_color = ticksOK ? colLbl : color.orange, bgcolor = colPanel, text_size = size.small)
+    r += 1
+    table.cell(t, 0, r, "Size (lots x100)", text_color = colLbl, bgcolor = colPanel, text_size = size.small)
+    table.cell(t, 1, r, str.tostring(lots, "#") + " lots / risk RM" + str.tostring(riskRM, "#"), text_color = colLbl, bgcolor = colPanel, text_size = size.small)
+    r += 1
+    table.cell(t, 0, r, "Notional", text_color = colLbl, bgcolor = colPanel, text_size = size.small)
+    table.cell(t, 1, r, "RM " + str.tostring(notional, "#") + " (" + str.tostring(notionalPctUsed, "#.#") + "%)", text_color = notionalPctUsed <= notionalCapPct ? color.lime : color.red, bgcolor = colPanel, text_size = size.small)
+    r += 1
+    table.cell(t, 0, r, "Liquidity (20d avg value)", text_color = colLbl, bgcolor = colPanel, text_size = size.small)
+    table.cell(t, 1, r, "RM " + str.tostring(valueSma / 1000, "#") + "k/day", text_color = f_col(liqOK), bgcolor = colPanel, text_size = size.small)
+    r += 1
+    table.cell(t, 0, r, "Net R:R @ " + str.tostring(targetR, "#.#") + "R", text_color = colLbl, bgcolor = colPanel, text_size = size.small)
+    table.cell(t, 1, r, "1 : " + str.tostring(netRR, "#.##"), text_color = netRR >= 2.0 ? color.lime : color.red, bgcolor = colPanel, text_size = size.small)
+    r += 1
+    table.cell(t, 0, r, "Target @ " + str.tostring(targetR, "#.#") + "R", text_color = colLbl, bgcolor = colPanel, text_size = size.small)
+    table.cell(t, 1, r, "RM " + str.tostring(targetPx, "#.###") + " (" + str.tostring(atrsToTgt, "#.#") + " ATR)", text_color = colLbl, bgcolor = colPanel, text_size = size.small)
+    r += 1
+    if showDetail
+        table.cell(t, 0, r, "Gross R for 1:2 net", text_color = colLbl, bgcolor = colPanel, text_size = size.small)
+        table.cell(t, 1, r, str.tostring(grossRNeeded, "#.##") + "R", text_color = colLbl, bgcolor = colPanel, text_size = size.small)
+        r += 1
+        table.cell(t, 0, r, "Headroom to 52w-hi", text_color = colLbl, bgcolor = colPanel, text_size = size.small)
+        table.cell(t, 1, r, blueSky ? "BLUE SKY" : str.tostring(headroomR, "#.##") + "R vs " + str.tostring(grossRNeeded, "#.##") + "R", text_color = blueSky ? color.lime : f_col(headroomR >= grossRNeeded), bgcolor = colPanel, text_size = size.small)
+        r += 1
+    table.cell(t, 0, r, "Target feasible", text_color = colLbl, bgcolor = colPanel, text_size = size.small)
+    table.cell(t, 1, r, f_txt(tgtFeasible), text_color = f_col(tgtFeasible), bgcolor = colPanel, text_size = size.small)

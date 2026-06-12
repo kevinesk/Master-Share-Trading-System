@@ -1,0 +1,230 @@
+//@version=5
+// =====================================================================
+// V11 SWING SNIPER PRO  —  KLSE Trend + Timing + Risk (all-in-one)
+// Tier 1: Trend Quality gates (Minervini Trend Template, RS vs KLCI, OBV)
+// Tier 2: Entry Timing gates (extension, pullback, coil, RSI, pivot break)
+// Tier 3: Risk Panel (stop, board-lot sizing, notional cap, net R:R)
+// Notes: every table.cell on its own line; no multi-line ternaries.
+// =====================================================================
+indicator("V11 Swing Sniper Pro", shorttitle = "V11 Sniper", overlay = true, calc_bars_count = 500)
+
+// ---------------------------- INPUTS ----------------------------
+grpMode    = "Mode"
+tradeMode  = input.string("Swing", "Trade mode", options = ["Swing", "Trend"], group = grpMode)
+
+grpTrend   = "Tier 1 — Trend Quality"
+rsSymbol   = input.symbol("FTSEMYX:FBMKLCI", "RS benchmark (KLCI)", group = grpTrend)
+nearHiPct  = input.float(25.0, "Max % below 52-wk high", group = grpTrend)
+aboveLoPct = input.float(30.0, "Min % above 52-wk low",  group = grpTrend)
+
+grpTime    = "Tier 2 — Entry Timing"
+emaFastLen = input.int(9,     "Fast EMA",                          group = grpTime)
+emaPbLen   = input.int(20,    "Pullback EMA",                      group = grpTime)
+atrLen     = input.int(14,    "ATR length",                        group = grpTime)
+maxExtATR  = input.float(4.0, "Max extension (ATR above pullback EMA)", group = grpTime)
+maxPctFast = input.float(8.0, "Max % above fast EMA",              group = grpTime)
+proxBandPct= input.float(3.0, "Pullback proximity band %",         group = grpTime)
+pbLookback = input.int(10,    "Pullback lookback (bars)",          group = grpTime)
+coilRatio  = input.float(0.70,"Coil: ATR5/ATR20 must be below",    group = grpTime)
+rsiHardCap = input.float(80.0,"RSI hard block",                    group = grpTime)
+pivotLen   = input.int(20,    "Pivot lookback (bars)",             group = grpTime)
+volMult    = input.float(1.5, "Breakout volume multiple",          group = grpTime)
+
+grpRisk    = "Tier 3 — Risk Panel"
+capital    = input.float(30000.0, "Capital (RM)",                     group = grpRisk)
+riskPct    = input.float(1.0,     "Risk per trade %",                 group = grpRisk)
+notionalCapPct = input.float(25.0,"Max notional per position %",      group = grpRisk)
+stopLook   = input.int(10,        "Stop: swing-low lookback (bars)",  group = grpRisk)
+stopBufPct = input.float(1.0,     "Stop buffer below swing low %",    group = grpRisk)
+targetR    = input.float(2.5,     "Target (gross R multiple)",        group = grpRisk)
+costPct    = input.float(0.70,    "Round-trip cost % of notional (VERIFY with broker)", group = grpRisk)
+stopMode   = input.string("Swing low", "Stop construction", options = ["Swing low", "ATR", "Tighter"], group = grpRisk)
+atrStopMult= input.float(1.5,     "ATR stop multiple (ATR mode)",     group = grpRisk)
+maxAtrTgt  = input.float(10.0,    "Max ATRs to target (feasibility)", group = grpRisk)
+
+grpUx      = "Display"
+showMAs    = input.bool(true, "Plot moving averages", group = grpUx)
+tableOpac  = input.int(0, "Table background transparency (0 = solid)", minval = 0, maxval = 60, group = grpUx)
+
+// ---------------------------- TIER 1 : TREND QUALITY ----------------------------
+sma50  = ta.sma(close, 50)
+sma150 = ta.sma(close, 150)
+sma200 = ta.sma(close, 200)
+hi52   = ta.highest(high, 252)
+lo52   = ta.lowest(low, 252)
+
+klciClose = request.security(rsSymbol, timeframe.period, close, lookahead = barmerge.lookahead_off)
+rsLine    = klciClose > 0 ? close / klciClose : na
+rsSma     = ta.sma(rsLine, 21)
+
+obvVal = ta.obv
+obvSma = ta.sma(obvVal, 20)
+
+g1_stack   = close > sma50 and sma50 > sma150 and sma150 > sma200
+g2_smaRise = sma200 > sma200[21]
+g3_nearHi  = close >= hi52 * (1 - nearHiPct / 100)
+g4_aboveLo = close >= lo52 * (1 + aboveLoPct / 100)
+g5_rs      = not na(rsLine) and rsLine > rsSma
+g6_obv     = obvVal > obvSma
+
+trendCount = (g1_stack ? 1 : 0) + (g2_smaRise ? 1 : 0) + (g3_nearHi ? 1 : 0) + (g4_aboveLo ? 1 : 0) + (g5_rs ? 1 : 0) + (g6_obv ? 1 : 0)
+trendOK    = trendCount == 6
+
+// ---------------------------- TIER 2 : ENTRY TIMING ----------------------------
+emaFast  = ta.ema(close, emaFastLen)
+emaPb    = ta.ema(close, emaPbLen)
+atrVal   = ta.atr(atrLen)
+rsiVal   = ta.rsi(close, 14)
+atrShort = ta.atr(5)
+atrLong  = ta.atr(20)
+volSma   = ta.sma(volume, 20)
+loRecent = ta.lowest(low, pbLookback)
+
+extATR  = atrVal > 0 ? (close - emaPb) / atrVal : 0.0
+pctFast = emaFast > 0 ? (close - emaFast) / emaFast * 100 : 0.0
+
+t1_notExtended = extATR <= maxExtATR and pctFast <= maxPctFast
+t2_nearEma     = loRecent <= emaPb * (1 + proxBandPct / 100)
+t3_coilTight   = atrLong > 0 and atrShort < atrLong * coilRatio
+t4_rsiOk       = rsiVal < rsiHardCap
+
+entryTimingOK = t1_notExtended and t2_nearEma and t3_coilTight and t4_rsiOk
+
+pivotHigh  = ta.highest(high[1], pivotLen)
+volConfirm = volume > volSma * volMult
+breakout   = close > pivotHigh and volConfirm
+
+// Trend-mode entry: controlled pullback to a rising 50 SMA
+sma50Rising = sma50 > sma50[5]
+pullback50  = low <= sma50 * (1 + proxBandPct / 100) and close > sma50 and sma50Rising and rsiVal < 70.0
+
+swingBuySignal = trendOK and entryTimingOK and breakout
+trendBuySignal = trendOK and pullback50
+buySignal      = tradeMode == "Swing" ? swingBuySignal : trendBuySignal
+
+// ---------------------------- TIER 3 : RISK PANEL ----------------------------
+stopSwing = ta.lowest(low, stopLook) * (1 - stopBufPct / 100)
+stopAtrLv = close - atrStopMult * atrVal
+stopLvl   = stopMode == "Swing low" ? stopSwing : stopMode == "ATR" ? stopAtrLv : math.max(stopSwing, stopAtrLv)
+riskShare = close - stopLvl
+
+lotsByRisk = riskShare > 0 ? math.floor(capital * riskPct / 100 / riskShare / 100) : 0
+lotsByCap  = close > 0 ? math.floor(capital * notionalCapPct / 100 / (close * 100)) : 0
+lots       = math.max(0, math.min(lotsByRisk, lotsByCap))
+shares     = lots * 100
+notional   = shares * close
+riskRM     = shares * riskShare
+notionalPctUsed = capital > 0 ? notional / capital * 100 : 0.0
+
+costShare  = close * costPct / 100                          // approx round-trip cost per share
+netReward  = targetR * riskShare - costShare
+netRiskPS  = riskShare + costShare
+netRR      = netRiskPS > 0 ? netReward / netRiskPS : 0.0
+grossRNeeded = riskShare > 0 ? 2.0 + 3.0 * costShare / riskShare : 0.0  // gross R for 1:2 NET
+
+// Reward feasibility — risk math means nothing if the market structure
+// cannot plausibly deliver the target. Two tests:
+//   1) Headroom: room to the 52-wk high must cover grossRNeeded
+//      (waived for blue-sky breakouts at/above the prior high — no supply)
+//   2) Volatility realism: target within maxAtrTgt ATRs of price
+targetPx    = close + targetR * riskShare
+headroomR   = riskShare > 0 ? (hi52 - close) / riskShare : 0.0
+blueSky     = close >= hi52 * 0.98
+atrsToTgt   = atrVal > 0 ? (targetPx - close) / atrVal : 0.0
+tgtFeasible = atrsToTgt <= maxAtrTgt and (blueSky or headroomR >= grossRNeeded)
+
+// ---------------------------- VERDICT ----------------------------
+verdict    = "BUY SETUP — verify live depth"
+verdictCol = color.lime
+if not trendOK
+    verdict    := "AVOID — trend gates fail (" + str.tostring(trendCount) + "/6)"
+    verdictCol := color.red
+else if tradeMode == "Swing" and not entryTimingOK
+    verdict    := "WATCH — timing blocked"
+    verdictCol := color.orange
+else if tradeMode == "Swing" and not breakout
+    verdict    := "READY — await pivot break + volume"
+    verdictCol := color.yellow
+else if tradeMode == "Trend" and not pullback50
+    verdict    := "HOLD ZONE — await 50-SMA pullback"
+    verdictCol := color.yellow
+else if not tgtFeasible
+    verdict    := "WATCH — target infeasible"
+    verdictCol := color.orange
+
+// ---------------------------- PLOTS & MARKERS ----------------------------
+plot(showMAs ? sma50  : na, "SMA 50",  color = color.orange)
+plot(showMAs ? sma150 : na, "SMA 150", color = color.aqua)
+plot(showMAs ? sma200 : na, "SMA 200", color = color.red)
+plot(showMAs ? emaPb  : na, "EMA 20",  color = color.new(color.blue, 30))
+
+plotshape(buySignal, title = "BUY", style = shape.triangleup, location = location.belowbar, color = color.lime, size = size.small, text = "BUY")
+plotshape(trendOK and not t1_notExtended, title = "Extended", style = shape.xcross, location = location.abovebar, color = color.orange, size = size.tiny)
+
+// ---------------------------- ALERTS ----------------------------
+alertcondition(swingBuySignal, title = "V11 Swing breakout", message = "V11: VCP pivot breakout with volume — verify chart, depth and risk panel before entry.")
+alertcondition(trendBuySignal, title = "V11 Trend pullback", message = "V11: Pullback to rising 50-SMA in qualified uptrend — verify before entry.")
+alertcondition(trendOK[1] and not trendOK, title = "V11 Trend deterioration", message = "V11: A trend-quality gate just failed — review open position.")
+
+// ---------------------------- DASHBOARD TABLE ----------------------------
+f_txt(b) =>
+    b ? "PASS" : "FAIL"
+f_col(b) =>
+    b ? color.lime : color.red
+
+colPanel = color.new(#131722, tableOpac)
+colHdr   = color.new(#2a2e39, tableOpac)
+colLbl   = color.new(#d1d4dc, 0)
+
+var table t = table.new(position.top_right, 2, 25, border_width = 1, border_color = color.new(#434651, 0))
+if barstate.islast
+    table.cell(t, 0, 0, "V11 SNIPER", text_color = color.white, bgcolor = color.new(color.black, 0), text_size = size.small)
+    table.cell(t, 1, 0, verdict, text_color = verdictCol, bgcolor = color.new(color.black, 0), text_size = size.small)
+    table.cell(t, 0, 1, "Mode", text_color = colLbl, bgcolor = colPanel, text_size = size.small)
+    table.cell(t, 1, 1, tradeMode, text_color = colLbl, bgcolor = colPanel, text_size = size.small)
+    table.cell(t, 0, 2, "— TREND —", text_color = color.white, bgcolor = colHdr, text_size = size.small)
+    table.cell(t, 1, 2, str.tostring(trendCount) + "/6", text_color = f_col(trendOK), bgcolor = colHdr, text_size = size.small)
+    table.cell(t, 0, 3, "MA stack 50>150>200", text_color = colLbl, bgcolor = colPanel, text_size = size.small)
+    table.cell(t, 1, 3, f_txt(g1_stack), text_color = f_col(g1_stack), bgcolor = colPanel, text_size = size.small)
+    table.cell(t, 0, 4, "200-SMA rising", text_color = colLbl, bgcolor = colPanel, text_size = size.small)
+    table.cell(t, 1, 4, f_txt(g2_smaRise), text_color = f_col(g2_smaRise), bgcolor = colPanel, text_size = size.small)
+    table.cell(t, 0, 5, "Near 52-wk high", text_color = colLbl, bgcolor = colPanel, text_size = size.small)
+    table.cell(t, 1, 5, f_txt(g3_nearHi), text_color = f_col(g3_nearHi), bgcolor = colPanel, text_size = size.small)
+    table.cell(t, 0, 6, "Above 52-wk low", text_color = colLbl, bgcolor = colPanel, text_size = size.small)
+    table.cell(t, 1, 6, f_txt(g4_aboveLo), text_color = f_col(g4_aboveLo), bgcolor = colPanel, text_size = size.small)
+    table.cell(t, 0, 7, "RS vs KLCI", text_color = colLbl, bgcolor = colPanel, text_size = size.small)
+    table.cell(t, 1, 7, f_txt(g5_rs), text_color = f_col(g5_rs), bgcolor = colPanel, text_size = size.small)
+    table.cell(t, 0, 8, "OBV accumulation", text_color = colLbl, bgcolor = colPanel, text_size = size.small)
+    table.cell(t, 1, 8, f_txt(g6_obv), text_color = f_col(g6_obv), bgcolor = colPanel, text_size = size.small)
+    table.cell(t, 0, 9, "— TIMING —", text_color = color.white, bgcolor = colHdr, text_size = size.small)
+    table.cell(t, 1, 9, f_txt(entryTimingOK), text_color = f_col(entryTimingOK), bgcolor = colHdr, text_size = size.small)
+    table.cell(t, 0, 10, "Ext (ATR / %fast)", text_color = colLbl, bgcolor = colPanel, text_size = size.small)
+    table.cell(t, 1, 10, str.tostring(extATR, "#.##") + " / " + str.tostring(pctFast, "#.#") + "%", text_color = f_col(t1_notExtended), bgcolor = colPanel, text_size = size.small)
+    table.cell(t, 0, 11, "Near EMA20 recently", text_color = colLbl, bgcolor = colPanel, text_size = size.small)
+    table.cell(t, 1, 11, f_txt(t2_nearEma), text_color = f_col(t2_nearEma), bgcolor = colPanel, text_size = size.small)
+    table.cell(t, 0, 12, "Coil ATR5/ATR20", text_color = colLbl, bgcolor = colPanel, text_size = size.small)
+    table.cell(t, 1, 12, str.tostring(atrLong > 0 ? atrShort / atrLong : 0.0, "#.##"), text_color = f_col(t3_coilTight), bgcolor = colPanel, text_size = size.small)
+    table.cell(t, 0, 13, "RSI(14)", text_color = colLbl, bgcolor = colPanel, text_size = size.small)
+    table.cell(t, 1, 13, str.tostring(rsiVal, "#.#"), text_color = f_col(t4_rsiOk), bgcolor = colPanel, text_size = size.small)
+    table.cell(t, 0, 14, "Pivot break + vol", text_color = colLbl, bgcolor = colPanel, text_size = size.small)
+    table.cell(t, 1, 14, breakout ? "YES" : "NO", text_color = f_col(breakout), bgcolor = colPanel, text_size = size.small)
+    table.cell(t, 0, 15, "— RISK (RM" + str.tostring(capital, "#") + ") —", text_color = color.white, bgcolor = colHdr, text_size = size.small)
+    table.cell(t, 1, 15, str.tostring(riskPct, "#.#") + "% = RM" + str.tostring(capital * riskPct / 100, "#"), text_color = colLbl, bgcolor = colHdr, text_size = size.small)
+    table.cell(t, 0, 16, "Stop level", text_color = colLbl, bgcolor = colPanel, text_size = size.small)
+    table.cell(t, 1, 16, "RM " + str.tostring(stopLvl, "#.###"), text_color = colLbl, bgcolor = colPanel, text_size = size.small)
+    table.cell(t, 0, 17, "Risk / share", text_color = colLbl, bgcolor = colPanel, text_size = size.small)
+    table.cell(t, 1, 17, "RM " + str.tostring(riskShare, "#.###"), text_color = colLbl, bgcolor = colPanel, text_size = size.small)
+    table.cell(t, 0, 18, "Size (lots x100)", text_color = colLbl, bgcolor = colPanel, text_size = size.small)
+    table.cell(t, 1, 18, str.tostring(lots, "#") + " lots / risk RM" + str.tostring(riskRM, "#"), text_color = colLbl, bgcolor = colPanel, text_size = size.small)
+    table.cell(t, 0, 19, "Notional", text_color = colLbl, bgcolor = colPanel, text_size = size.small)
+    table.cell(t, 1, 19, "RM " + str.tostring(notional, "#") + " (" + str.tostring(notionalPctUsed, "#.#") + "%)", text_color = notionalPctUsed <= notionalCapPct ? color.lime : color.red, bgcolor = colPanel, text_size = size.small)
+    table.cell(t, 0, 20, "Net R:R @ " + str.tostring(targetR, "#.#") + "R", text_color = colLbl, bgcolor = colPanel, text_size = size.small)
+    table.cell(t, 1, 20, "1 : " + str.tostring(netRR, "#.##"), text_color = netRR >= 2.0 ? color.lime : color.red, bgcolor = colPanel, text_size = size.small)
+    table.cell(t, 0, 21, "Gross R for 1:2 net", text_color = colLbl, bgcolor = colPanel, text_size = size.small)
+    table.cell(t, 1, 21, str.tostring(grossRNeeded, "#.##") + "R", text_color = colLbl, bgcolor = colPanel, text_size = size.small)
+    table.cell(t, 0, 22, "Target @ " + str.tostring(targetR, "#.#") + "R", text_color = colLbl, bgcolor = colPanel, text_size = size.small)
+    table.cell(t, 1, 22, "RM " + str.tostring(targetPx, "#.###") + " (" + str.tostring(atrsToTgt, "#.#") + " ATR)", text_color = colLbl, bgcolor = colPanel, text_size = size.small)
+    table.cell(t, 0, 23, "Headroom to 52w-hi", text_color = colLbl, bgcolor = colPanel, text_size = size.small)
+    table.cell(t, 1, 23, blueSky ? "BLUE SKY" : str.tostring(headroomR, "#.##") + "R vs " + str.tostring(grossRNeeded, "#.##") + "R", text_color = blueSky ? color.lime : f_col(headroomR >= grossRNeeded), bgcolor = colPanel, text_size = size.small)
+    table.cell(t, 0, 24, "Target feasible", text_color = colLbl, bgcolor = colPanel, text_size = size.small)
+    table.cell(t, 1, 24, f_txt(tgtFeasible), text_color = f_col(tgtFeasible), bgcolor = colPanel, text_size = size.small)
