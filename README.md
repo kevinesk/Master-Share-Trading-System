@@ -49,7 +49,7 @@ TradingView (live) ── confirm + execute with the Pine indicators below
 | `TradingView/` | 8 small single-purpose utilities (trend template, RS rating, BB squeeze…) | — |
 | `US Market System/` | SPX-benchmarked mirror of the KLSE stack | v1 |
 
-> Note: KLSE_MASTER_SYSTEM.md (authored 2026-05-30) references **V10** Swing Sniper; V11/V12 were added later. Confirm which version you trade and keep the doc in sync.
+> **V12 is the primary swing entry tool** (Master System §5, settings: Hard macro gate, 10% notional cap). V10 stays on the chart for parallel validation until **2026-07-03** — trust only its EXECUTE NOW signal. V11 is archived (signal-integrity bug, fixed in V12).
 
 ## TradingView usage
 

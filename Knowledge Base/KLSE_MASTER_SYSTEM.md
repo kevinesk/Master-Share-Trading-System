@@ -39,7 +39,7 @@ Forget single-style trading. KLSE rewards a **3-bucket portfolio** matched to it
 
 | Bucket | % of capital (default) | Style | Hold | Entry source | KB anchor |
 |---|---|---|---|---|---|
-| **A — Momentum / Leaders** | 40% | Stage 2 breakouts, VCP, Trend Retracement | 2–12 weeks | V10 Swing Sniper + KLSE MSS v6 + V8 Sniper | [02](02_Minervini_SEPA_KLSE.md), [10](10_CAN_SLIM_KLSE.md), [42](42_Momentum_Masters_Advanced_VCP.md), [59](59_Adam_Khoo_Piranha_Profits.md) |
+| **A — Momentum / Leaders** | 40% | Stage 2 breakouts, VCP, Trend Retracement | 2–12 weeks | V12 Swing Sniper Pro + KLSE MSS v6 + V8 Sniper | [02](02_Minervini_SEPA_KLSE.md), [10](10_CAN_SLIM_KLSE.md), [42](42_Momentum_Masters_Advanced_VCP.md), [59](59_Adam_Khoo_Piranha_Profits.md) |
 | **B — Value-Bargain** | 25% | Quality at discount during weakness | 6 weeks – 18 months | [KLSE Bargain Hunting Screeners](KLSE_BARGAIN_HUNTING_SCREENERS.md) | [53](53_KC_Chong_Bursa_Value_Investing.md), [57](57_Cold_Eye_Local_Value_Compounding.md), bargain memory |
 | **C — Whale / Yield Compound** | 15% | VMI™ 7-step gate passes; high-quality compounders | 1–5 years | Whale Investor pre-buy gate ([PRE_TRADE_CHECKLIST](PRE_TRADE_CHECKLIST.md)) | [46](46_Lynch_Six_Categories.md), [59](59_Adam_Khoo_Piranha_Profits.md), [KLSE_QUALITY_SCORE](KLSE_QUALITY_SCORE.md) |
 | **D — Cash / T-bills floor** | **20% MINIMUM** | Capital preservation reserve | Always | — | Anchor principle 4 |
@@ -146,11 +146,13 @@ Run every **Sunday** during [WEEKLY_ROUTINE.md](WEEKLY_ROUTINE.md). Updates in [
 ### Bucket A — Momentum (40%)
 
 **Sources (in order of priority):**
-1. V10 Swing Sniper EXECUTE NOW alert (highest priority — all signals aligned + coil released)
-2. V10 Swing Sniper SWING BUY alert
-3. V10 Khoo Trend Retracement BUY (Profit Snapper pullback to EMA20/50)
-4. KLSE MSS v6 COIL pre-surge signal
-5. Manual scan: Pro Quant Desk v9 dashboard top of heatmap + Trend Template 8/8
+1. V12 Swing Sniper Pro "Swing breakout" alert (highest priority — trend 6/6 + coil released + macro Hard gate + liquidity/feasibility/stop checks)
+2. V12 "Trend pullback" alert (controlled pullback to rising 50-SMA — replaces V10 Khoo retrace)
+3. KLSE MSS v6 COIL pre-surge signal
+4. Manual scan: Pro Quant Desk v9 dashboard top of heatmap + Trend Template 8/8
+
+> **V12 settings (locked):** macro gate **Hard**, notional cap **10%** (per §6), auto-risk by regime ON, sector set per chart.
+> **Parallel validation until 2026-07-03:** keep V10 on the chart and journal both. From V10, trust **only EXECUTE NOW** — its plain SWING BUY fires on a bare 10-day high with no base behind it (the latecomer flaw the Python screener v2.3 patched). After validation, archive V10. V11 is already archived (it could fire BUY while its own verdict said WATCH — fixed in V12).
 
 **Must clear:**
 - Trend Template ≥ 7/8 (rare: 6/8 with elite RS rating)
@@ -427,7 +429,7 @@ Saying no to things is part of the edge.
 | Decide an exit | [12](12_Perfect_Entry_Exit.md), [38](38_Pit_Bull_Schwartz_Method.md), [55](55_Tan_Chong_Koay_Never_Fully_Invested.md) |
 | Audit performance | [24](24_Trading_Statistics_Essentials.md), [25](25_Probability_Edge_Calculation.md), [14](14_Backtesting_Framework.md), [TRADE_JOURNAL.md](TRADE_JOURNAL.md) |
 | Pre-buy gate (Whale) | [PRE_TRADE_CHECKLIST.md](PRE_TRADE_CHECKLIST.md) top section, [59](59_Adam_Khoo_Piranha_Profits.md) |
-| Indicator on TradingView | `KLSE Momentum Swing Screener/V10 Swing Sniper (KLSE).pine`, `Pro Quant Desk (KLSE)/...v9.pine`, `Minervini VCP + SmartMCDX Backtest/...v9.pine` |
+| Indicator on TradingView | `KLSE Momentum Swing Screener/V12 Swing Sniper Pro (KLSE).pine` (primary; V10 in parallel until 2026-07-03), `Pro Quant Desk (KLSE)/...v9.pine`, `Minervini VCP + SmartMCDX Backtest/...v9.pine` |
 
 ---
 
@@ -436,6 +438,7 @@ Saying no to things is part of the edge.
 | Version | Date | Change |
 |---|---|---|
 | 1.0 | 2026-05-30 | Initial system spec synthesising KB files 01–59 + operational templates + V10 indicators. Three-bucket portfolio, 7-light regime, dynamic 0.5–2% sizing, ATR-offset stops, SVS + VMI gates, circuit breakers, daily decision card. |
+| 1.1 | 2026-06-12 | Bucket A primary entry source upgraded V10 → V12 Swing Sniper Pro (liquidity floor, target feasibility, tick-size stop sanity, 5-tier regime risk scaler; V12 notional-cap default fixed to the §6 10% cap). V10 kept in parallel for validation until 2026-07-03; V11 archived (BUY/verdict mismatch bug). Weekly 7-light board now semi-automated via `KLSE Screener/macro_lights.py`. |
 
 ---
 
