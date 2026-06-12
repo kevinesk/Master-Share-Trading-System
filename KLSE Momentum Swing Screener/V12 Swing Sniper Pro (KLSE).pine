@@ -87,6 +87,7 @@ minNetRR   = input.float(2.0,     "Min net R:R (hard gate)",          group = gr
 grpUx      = "Display"
 showMAs    = input.bool(true, "Plot moving averages", group = grpUx)
 showLevels = input.bool(true, "Draw stop/target/pivot levels on chart", group = grpUx)
+lblSize    = input.string("Normal", "Level tag size", options = ["Small", "Normal", "Large"], group = grpUx)
 showDetail = input.bool(false, "Table: show gate detail rows", group = grpUx)
 tableOpac  = input.int(0, "Table background transparency (0 = solid)", minval = 0, maxval = 60, group = grpUx)
 
@@ -404,12 +405,17 @@ if barstate.islast
     label.delete(lbTgt)
     label.delete(lbPvt)
     if showLevels and trendOK
-        lnStop := line.new(bar_index - 1, stopLvl, bar_index + 10, stopLvl, color = color.red, width = 2)
-        lnTgt  := line.new(bar_index - 1, targetPx, bar_index + 10, targetPx, color = color.lime, width = 2)
-        lnPvt  := line.new(bar_index - 1, pivotHigh, bar_index + 10, pivotHigh, color = color.yellow, style = line.style_dashed, width = 1)
-        lbStop := label.new(bar_index + 10, stopLvl, "STOP RM " + str.tostring(stopLvl, "#.###") + " (-" + str.tostring(stopPctW, "#.#") + "%)", style = label.style_label_left, color = color.new(color.red, 70), textcolor = color.white, size = size.small)
-        lbTgt  := label.new(bar_index + 10, targetPx, "TARGET RM " + str.tostring(targetPx, "#.###") + " (" + str.tostring(targetR, "#.#") + "R)", style = label.style_label_left, color = color.new(color.green, 70), textcolor = color.white, size = size.small)
-        lbPvt  := label.new(bar_index + 10, pivotHigh, "PIVOT RM " + str.tostring(pivotHigh, "#.###"), style = label.style_label_left, color = color.new(color.gray, 60), textcolor = color.yellow, size = size.small)
+        // Solid tags, staggered x-offsets so BUY/STOP/TARGET never overlap
+        // even when the levels sit ticks apart. BUY (orange) = the pivot
+        // trigger, the only price where this plan becomes actionable.
+        lsz    = lblSize == "Small" ? size.small : lblSize == "Large" ? size.large : size.normal
+        pvtPct = close > 0 ? (pivotHigh / close - 1) * 100 : 0.0
+        lnPvt  := line.new(bar_index - 1, pivotHigh, bar_index + 12, pivotHigh, color = color.orange, style = line.style_dashed, width = 2)
+        lnStop := line.new(bar_index - 1, stopLvl, bar_index + 16, stopLvl, color = color.red, width = 2)
+        lnTgt  := line.new(bar_index - 1, targetPx, bar_index + 20, targetPx, color = color.lime, width = 2)
+        lbPvt  := label.new(bar_index + 12, pivotHigh, "BUY > RM " + str.tostring(pivotHigh, "#.###") + " (pivot, " + (pvtPct >= 0 ? "+" : "") + str.tostring(pvtPct, "#.#") + "% away)", style = label.style_label_left, color = color.orange, textcolor = color.black, size = lsz)
+        lbStop := label.new(bar_index + 16, stopLvl, "STOP RM " + str.tostring(stopLvl, "#.###") + " (-" + str.tostring(stopPctW, "#.#") + "% | " + str.tostring(stopTicks, "#") + " ticks)", style = label.style_label_left, color = color.red, textcolor = color.white, size = lsz)
+        lbTgt  := label.new(bar_index + 20, targetPx, "TARGET RM " + str.tostring(targetPx, "#.###") + " (" + str.tostring(targetR, "#.#") + "R | net 1:" + str.tostring(netRR, "#.#") + ")", style = label.style_label_left, color = color.green, textcolor = color.white, size = lsz)
 
 // ---------------------------- ALERTS ----------------------------
 alertcondition(swingBuySignal, title = "V12 Swing breakout", message = "V12: VCP pivot breakout with volume, macro + liquidity + feasibility clear - verify chart, depth and risk panel before entry.")
