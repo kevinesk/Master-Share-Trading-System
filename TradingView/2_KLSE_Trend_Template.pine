@@ -1,0 +1,39 @@
+//@version=5
+indicator("KLSE Trend Template", overlay=true)
+
+// EMAs
+e21  = ta.ema(close, 21)
+e50  = ta.ema(close, 50)
+e150 = ta.ema(close, 150)
+e200 = ta.ema(close, 200)
+
+// 52-week high/low (260 trading days = 52 weeks)
+hi52 = ta.highest(high, 260)
+lo52 = ta.lowest(low, 260)
+
+// Trend Template criteria
+c1 = close > e150
+c2 = close > e200
+c3 = e150 > e200
+c4 = e200 > e200[20]                        // EMA200 trending up (vs 4 weeks ago)
+c5 = e50 > e150
+c6 = close > e50
+c7 = (close / lo52 - 1) >= 0.30             // At least 30% above 52W low
+c8 = (close / hi52 - 1) >= -0.25            // Within 25% of 52W high
+
+score = (c1?1:0) + (c2?1:0) + (c3?1:0) + (c4?1:0) + (c5?1:0) + (c6?1:0) + (c7?1:0) + (c8?1:0)
+
+// Background colour based on score
+bgCol = score >= 7 ? color.new(color.green, 90) : score >= 5 ? color.new(color.blue, 90) : score >= 3 ? color.new(color.orange, 92) : color.new(color.red, 93)
+bgcolor(bgCol)
+
+// Plot EMAs
+plot(e21,  color=color.purple, linewidth=1, title="EMA21")
+plot(e50,  color=color.blue,   linewidth=2, title="EMA50")
+plot(e150, color=color.orange, linewidth=1, title="EMA150")
+plot(e200, color=color.red,    linewidth=2, title="EMA200")
+
+// Score label on chart
+lblCol = score >= 7 ? color.green : score >= 5 ? color.blue : color.red
+if barstate.islast
+    label.new(bar_index, high * 1.01, text="TT:" + str.tostring(score) + "/8", color=lblCol, style=label.style_label_down, size=size.small)

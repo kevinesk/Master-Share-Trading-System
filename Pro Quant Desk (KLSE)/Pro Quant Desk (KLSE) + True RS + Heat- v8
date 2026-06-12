@@ -1,0 +1,380 @@
+//@version=5
+// ================================================================
+// V8 Pro Quant Desk (KLSE) + True RS + Heat
+// KLSE / Bursa Malaysia Edition
+//
+// Improvements vs V7:
+//  [v7-1]  EMA calculations anchored to Daily TF via request.security
+//  [v7-2]  Replaced nz() with proper na() guards
+//  [v7-3]  RS now requires momentum confirmation (ratio must be rising)
+//  [v7-4]  Squeeze: added BB+KC (TTM Squeeze) mode alongside ATR-only
+//  [v7-5]  Accumulation window configurable (was hardcoded 4 bars)
+//  [v7-6]  Signal deduplication — only FIRST bar of a signal sequence
+//  [v7-7]  Win rate uses N-bar forward return (not same-bar momentum)
+//  [v7-8]  Peak equity explicitly initialized to 10,000
+//  [v7-9]  SL / TP1 / TP2 horizontal lines drawn on chart (ATR-based)
+//  [v7-10] BUY label plotted on chart when execute fires
+//  [v7-11] Strike zone visualized as yellow bgcolor + diamond shape
+//  [v7-12] Bar coloring by trend state (teal = full, blue = daily only)
+//  [v7-13] Dashboard: solid dark cell backgrounds
+//  [v7-14] Dashboard: barstate.islast or barstate.isrealtime fix
+//  [v7-15] Expectancy and drawdown shown in dashboard
+//  [v7-16] All key parameters made user-configurable
+//  [v8-1]  Hammer detection — upgrades EXECUTE to EXECUTE+ (highest conviction)
+//  [v8-2]  Tranche exit labels — SELL 1/3 plotted at TP1 and TP2 hits
+//  [v8-3]  Trailing stop after TP1 hit — trails below stop EMA
+//  [v8-4]  Stop mode toggle — Fundamental (EMA 200) vs Momentum (EMA 20)
+//  [v8-5]  VCP COIL alert — fires at tightest squeeze before breakout surge
+//  [v8-6]  MCDX smart money proxy added to dashboard
+//  [v8-7]  Alerts for COIL, TP1, TP2 and EXIT added
+// ================================================================
+indicator("V8 Pro Quant Desk (KLSE) + True RS + Heat", overlay=true, max_labels_count=200, max_lines_count=10)
+
+// ================================================================
+// 1. INPUTS
+// ================================================================
+grp_core = "1. Core Settings"
+idx       = input.symbol("MYX:FBMKLCI", "Market Index (FBM KLCI)", group=grp_core)
+anchor_tf = input.timeframe("D", "[v7] EMA Anchor Timeframe", group=grp_core)
+
+grp_vcp = "2. VCP & Breakout"
+base_lookback  = input.int(30,    "Base High Lookback (Bars)",       minval=10, maxval=100, group=grp_vcp)
+accum_window   = input.int(10,    "[v7] Accumulation Window (Bars)", minval=2,  maxval=30,  group=grp_vcp)
+vol_mult_bo    = input.float(1.5, "Breakout Volume Multiplier",      step=0.1,              group=grp_vcp)
+use_bb_squeeze = input.bool(true, "[v7] BB+KC Squeeze (TTM Mode)",                         group=grp_vcp)
+
+grp_rs = "3. Relative Strength"
+rs_len      = input.int(50, "RS Trend SMA Length",              minval=10, group=grp_rs)
+rs_mom_bars = input.int(5,  "[v7] RS Momentum Lookback (Bars)", minval=1,  group=grp_rs)
+
+grp_risk = "4. Risk Management"
+swing_limit  = input.float(35.0, "Max Swing Exposure %",             minval=5, maxval=100, step=5, group=grp_risk) / 100
+win_rr       = input.float(20.0, "Win Return % (R-multiple)",        step=1.0,                     group=grp_risk) / 100
+loss_rr      = input.float(8.0,  "Loss Risk %  (R-multiple)",        step=1.0,                     group=grp_risk) / 100
+fwd_bars     = input.int(5,      "[v7] Forward Return Check (Bars)", minval=1, maxval=20,           group=grp_risk)
+atr_sl_mult  = input.float(2.0,  "[v7] Stop Loss ATR Multiplier",    step=0.1,                     group=grp_risk)
+atr_tp1_mult = input.float(3.0,  "[v7] TP1 ATR Multiplier",          step=0.1,                     group=grp_risk)
+atr_tp2_mult = input.float(5.0,  "[v7] TP2 ATR Multiplier",          step=0.1,                     group=grp_risk)
+
+// [v8-4] Stop mode
+grp_exit = "5. Exit Management"
+stop_mode    = input.string("Momentum (EMA 20)", "Stop Mode", options=["Momentum (EMA 20)", "Fundamental (EMA 200)"], group=grp_exit,
+  tooltip="Momentum: cut below EMA 20. Strong fundamental hold: cut only below EMA 200.")
+trail_buffer = input.float(1.0, "Trail Buffer Below EMA (%)", minval=0.1, maxval=3.0, step=0.1, group=grp_exit,
+  tooltip="After TP1 hit, trailing stop sits this % below the chosen stop EMA.")
+
+// [v8-5] VCP COIL settings
+grp_coil = "6. VCP COIL — Pre-Breakout Alert"
+coil_vol_bars  = input.int(20,    "Volume Dry-Up Lookback (Bars)",  minval=5, maxval=60, group=grp_coil,
+  tooltip="COIL fires when volume is at its lowest in N bars — squeeze wound to maximum before breakout.")
+coil_mcdx_gate = input.bool(true, "Require MCDX Bullish for COIL", group=grp_coil,
+  tooltip="Only alert COIL if smart money (MCDX) is still positive.")
+
+// [v8-1] Hammer settings
+grp_hammer = "7. Hammer Pattern"
+use_hammer       = input.bool(true, "Detect Hammer at Breakout (upgrades to EXECUTE+)", group=grp_hammer)
+hammer_wick_mult = input.float(2.0, "Min Lower Wick / Body Ratio", group=grp_hammer, minval=1.0, step=0.1)
+hammer_upper_max = input.float(0.5, "Max Upper Wick / Body Ratio", group=grp_hammer, minval=0.0, step=0.1)
+
+grp_disp = "8. Display"
+show_sl_tp       = input.bool(true,  "[v7] Show SL / TP Lines on Chart",  group=grp_disp)
+show_strike      = input.bool(true,  "[v7] Show Strike Zone Highlight",   group=grp_disp)
+show_barcolor    = input.bool(true,  "[v7] Color Bars by Trend State",    group=grp_disp)
+show_squeeze_row = input.bool(true,  "Dashboard: VCP Squeeze Row",        group=grp_disp)
+show_mcdx_row    = input.bool(true,  "Dashboard: MCDX Row",               group=grp_disp)
+show_volbrk_row  = input.bool(false, "Dashboard: Vol Breakout Row",       group=grp_disp)
+show_strike_row  = input.bool(true,  "Dashboard: Strike Zone Row",        group=grp_disp)
+show_risk_row    = input.bool(true,  "Dashboard: Risk / Exposure Row",    group=grp_disp)
+
+// ================================================================
+// 2. MULTI-TIMEFRAME TREND CONFIRMATION [v7-1] [v7-2]
+// ================================================================
+// [v8-4] Add daily EMA20 for stop mode (alongside existing 50/150/200)
+ema20_d  = request.security(syminfo.tickerid, anchor_tf, ta.ema(close, 20),  lookahead=barmerge.lookahead_off)
+ema50_d  = request.security(syminfo.tickerid, anchor_tf, ta.ema(close, 50),  lookahead=barmerge.lookahead_off)
+ema150_d = request.security(syminfo.tickerid, anchor_tf, ta.ema(close, 150), lookahead=barmerge.lookahead_off)
+ema200_d = request.security(syminfo.tickerid, anchor_tf, ta.ema(close, 200), lookahead=barmerge.lookahead_off)
+
+trend        = not na(ema50_d) and not na(ema150_d) and not na(ema200_d) and close > ema200_d and ema50_d > ema150_d and ema150_d > ema200_d
+htfTrend     = request.security(syminfo.tickerid, "W", not na(ta.ema(close, 200)) and close > ta.ema(close, 200), lookahead=barmerge.lookahead_off)
+trendConfirm = trend and htfTrend
+
+// ================================================================
+// 3. TRUE RELATIVE STRENGTH ENGINE [v7-3]
+// ================================================================
+idxClose   = request.security(idx, timeframe.period, close, lookahead=barmerge.lookahead_off)
+trueRS     = not na(idxClose) and idxClose > 0 ? close / idxClose : na
+rsTrend    = ta.sma(trueRS, rs_len)
+rsLeading  = not na(trueRS) and not na(rsTrend) and trueRS > rsTrend
+rsMomentum = not na(trueRS) and not na(trueRS[rs_mom_bars]) and trueRS > trueRS[rs_mom_bars]
+rsConfirm  = rsLeading and rsMomentum
+
+// ================================================================
+// 4. VCP EDGE & VOLUME [v7-4] [v7-5]
+// ================================================================
+volAvg = ta.sma(volume, 20)
+atr14  = ta.atr(14)
+atr_ma = ta.sma(atr14, 20)
+
+bb_basis = ta.sma(close, 20)
+bb_dev   = ta.stdev(close, 20)
+bb_upper = bb_basis + bb_dev * 2.0
+bb_lower = bb_basis - bb_dev * 2.0
+kc_basis = ta.ema(close, 20)
+kc_upper = kc_basis + atr_ma * 1.5
+kc_lower = kc_basis - atr_ma * 1.5
+bb_kc_sq = bb_upper < kc_upper and bb_lower > kc_lower
+
+atr_sq_bar  = atr14 < atr_ma and volume < volAvg
+squeeze_bar = use_bb_squeeze ? bb_kc_sq : atr_sq_bar
+
+accum = false
+for i = 1 to accum_window
+    if squeeze_bar[i]
+        accum := true
+
+baseHigh = ta.highest(high, base_lookback)
+breakout = close > baseHigh[1]
+volBreak = volume > volAvg * vol_mult_bo
+
+// ================================================================
+// [v8-6] MCDX SMART MONEY PROXY
+// ================================================================
+mcdx     = ((ta.rsi(close, 14) - 50) * 3) + ((ta.mfi(hlc3, 14) - 50) * 2)
+mcdxBull = mcdx > 0
+
+// ================================================================
+// [v8-1] HAMMER CANDLESTICK DETECTION
+// ================================================================
+body       = math.abs(close - open)
+totalRange = high - low
+lowerWick  = math.min(open, close) - low
+upperWick  = high - math.max(open, close)
+isHammer   = use_hammer and totalRange > 0 and body > 0
+           and lowerWick >= body * hammer_wick_mult
+           and upperWick <= body * hammer_upper_max
+           and close >= open
+
+// ================================================================
+// 5. A+ SIGNAL & DEDUPLICATION [v7-6]
+// ================================================================
+signal     = trendConfirm and rsConfirm and accum and breakout and volBreak
+new_signal = signal and not signal[1]
+
+// ================================================================
+// 6. TRADE JOURNAL & METRICS [v7-7] [v7-8]
+// ================================================================
+var float trades = 0.0
+var float wins   = 0.0
+var float losses = 0.0
+
+if new_signal[fwd_bars]
+    trades += 1
+    if close > close[fwd_bars]
+        wins   += 1
+    else
+        losses += 1
+
+winRate    = trades > 0 ? (wins / trades) * 100 : 0
+expectancy = (winRate / 100 * win_rr) - ((1.0 - winRate / 100) * loss_rr)
+
+var float equity = 10000.0
+var float peak   = 10000.0
+
+if new_signal[fwd_bars]
+    won     = close > close[fwd_bars]
+    equity := equity + (won ? equity * win_rr : -(equity * loss_rr))
+
+peak     := math.max(peak, equity)
+drawdown  = peak > 0 ? (equity - peak) / peak : 0.0
+riskOff   = drawdown < -0.10 or expectancy < 0
+
+// ================================================================
+// 7. PORTFOLIO HEAT & EXECUTION GATE
+// ================================================================
+maxExposure  = riskOff ? swing_limit / 2.0 : swing_limit
+execute      = new_signal and not riskOff
+execute_plus = execute and isHammer  // [v8-1] hammer at breakout = highest conviction
+
+// ================================================================
+// [v8-5] VCP COIL — fires BEFORE the breakout surge
+// Trend + RS confirmed + squeeze active + volume at N-bar low + not yet broken out
+// ================================================================
+coil_mcdx_ok    = coil_mcdx_gate ? mcdxBull : true
+vol_at_nbar_low = volume <= ta.lowest(volume, coil_vol_bars)
+coil_signal     = trendConfirm and rsConfirm and squeeze_bar and vol_at_nbar_low and coil_mcdx_ok and not breakout
+new_coil        = coil_signal and not coil_signal[1]
+
+// ================================================================
+// [v8-4] STOP MODE (daily anchored)
+// ================================================================
+stop_ema_val  = stop_mode == "Fundamental (EMA 200)" ? ema200_d : ema20_d
+hard_stop_hit = not na(stop_ema_val) and close < stop_ema_val
+trail_ema_val = stop_mode == "Fundamental (EMA 200)" ? ema50_d : ema20_d
+
+// ================================================================
+// 8. SL / TP LEVELS [v7-9] + TRANCHE EXITS [v8-2] + TRAILING STOP [v8-3]
+// ================================================================
+var float active_sl  = na
+var float active_tp1 = na
+var float active_tp2 = na
+var bool  tp1_hit    = false
+var bool  tp2_hit    = false
+var float trail_stop = na
+
+if execute
+    active_sl  := close - atr14 * atr_sl_mult
+    active_tp1 := close + atr14 * atr_tp1_mult
+    active_tp2 := close + atr14 * atr_tp2_mult
+    tp1_hit    := false
+    tp2_hit    := false
+    trail_stop := na
+
+// TP1 hit — SELL 1/3, activate trailing stop
+tp1_reached = not na(active_tp1) and high >= active_tp1 and not tp1_hit
+if tp1_reached
+    tp1_hit    := true
+    active_tp1 := na
+    trail_stop := trail_ema_val * (1 - trail_buffer / 100)
+
+// TP2 hit — SELL 1/3
+tp2_reached = not na(active_tp2) and high >= active_tp2 and not tp2_hit
+if tp2_reached
+    tp2_hit    := true
+    active_tp2 := na
+
+// Update trailing stop upward only
+if tp1_hit and not na(trail_stop)
+    trail_stop := math.max(trail_stop, trail_ema_val * (1 - trail_buffer / 100))
+
+trail_stop_hit = tp1_hit and not na(trail_stop) and close < trail_stop
+
+// Full reset on any stop trigger
+if (not na(active_sl) and low <= active_sl) or hard_stop_hit or trail_stop_hit
+    active_sl  := na
+    active_tp1 := na
+    active_tp2 := na
+    tp1_hit    := false
+    tp2_hit    := false
+    trail_stop := na
+
+// ================================================================
+// 9. CHART VISUALS [v7-10][v7-11][v7-12] + [v8-1][v8-2][v8-5]
+// ================================================================
+
+// [v8-5] COIL — earliest signal, purple circle below bar
+plotshape(new_coil, title="VCP COIL", style=shape.circle, location=location.belowbar, color=color.new(#7B1FA2, 0), textcolor=color.white, size=size.small)
+bgcolor(coil_signal and not execute ? color.new(#4A148C, 95) : na, title="COIL Background")
+
+// [v8-1] Execute+ (hammer at breakout) shown in bright green; plain Execute in teal
+plotshape(execute_plus,                 title="EXECUTE+ Signal", style=shape.labelup, location=location.belowbar, color=color.new(#00E676, 0), text="EXECUTE+", textcolor=color.black, size=size.normal)
+plotshape(execute and not execute_plus, title="EXECUTE Signal",  style=shape.labelup, location=location.belowbar, color=color.new(#00BCD4, 0), text="BUY",      textcolor=color.black, size=size.normal)
+
+// [v8-2] Tranche exit labels
+plotshape(tp1_reached,                  title="SELL 1/3 at TP1", style=shape.labeldown, location=location.abovebar, color=color.new(#FF9800, 0), textcolor=color.white, text="SELL 1/3", size=size.small)
+plotshape(tp2_reached,                  title="SELL 1/3 at TP2", style=shape.labeldown, location=location.abovebar, color=color.new(#FFD740, 0), textcolor=color.white, text="SELL 1/3", size=size.small)
+plotshape(trail_stop_hit or hard_stop_hit, title="EXIT",         style=shape.labeldown, location=location.abovebar, color=color.new(#FF5252, 0), textcolor=color.white, text="EXIT",      size=size.small)
+
+// [v7-11] Strike zone — 3% above daily EMA20 while trend confirmed
+// [v8] Uses daily EMA20 (ema20_d) instead of chart-TF EMA20 for accuracy on any chart period
+strikeZone = close >= ema20_d and close <= ema20_d * 1.03 and trendConfirm
+plotshape(show_strike and strikeZone, "Strike Zone", shape.diamond, location.belowbar, color=color.new(color.yellow, 10), size=size.tiny)
+bgcolor(show_strike and strikeZone ? color.new(color.yellow, 90) : na, title="Strike Zone Background")
+
+// [v7-12] Bar coloring by trend state
+barcolor(show_barcolor and trendConfirm ? color.new(color.teal, 55) : show_barcolor and trend ? color.new(color.blue, 55) : na, title="Trend Bar Color")
+
+// SL / TP lines
+plot(show_sl_tp ? active_sl  : na, "Stop Loss",  color=color.new(color.red,   20), linewidth=1, style=plot.style_linebr)
+plot(show_sl_tp ? active_tp1 : na, "TP1",        color=color.new(color.lime,  20), linewidth=2, style=plot.style_linebr)
+plot(show_sl_tp ? active_tp2 : na, "TP2",        color=color.new(color.teal,  20), linewidth=1, style=plot.style_linebr)
+plot(show_sl_tp and not na(trail_stop) ? trail_stop : na, "Trail Stop", color=color.new(#CE93D8, 0), linewidth=1, style=plot.style_linebr)
+
+// [v8-4] Stop EMA — active stop boundary on chart
+plot(show_sl_tp and not na(stop_ema_val) ? stop_ema_val : na, "Stop EMA (daily)", color=color.new(#FF5252, 40), linewidth=2, style=plot.style_line)
+
+// ================================================================
+// 10. DASHBOARD [v7-13][v7-14][v7-15] + [v8-6]
+// ================================================================
+c_hdr = color.rgb(20,  20,  70)
+c_lbl = color.rgb(20,  20,  38)
+c_good = color.rgb(10,  58,  10)
+c_bad  = color.rgb(68,  10,  10)
+c_warn = color.rgb(68,  48,   0)
+c_neu  = color.rgb(28,  28,  42)
+c_txt  = color.white
+c_sub  = color.rgb(155, 165, 185)
+
+// Dynamic row wiring — optional rows collapse when hidden
+r8_trend   = 1
+r8_rs      = 2
+r8_squeeze = 3
+r8_mcdx    = r8_squeeze + (show_squeeze_row ? 1 : 0)
+r8_volbrk  = r8_mcdx   + (show_mcdx_row    ? 1 : 0)
+r8_strike  = r8_volbrk + (show_volbrk_row   ? 1 : 0)
+r8_risk    = r8_strike + (show_strike_row   ? 1 : 0)
+r8_stop    = r8_risk   + (show_risk_row     ? 1 : 0)
+r8_signal  = r8_stop   + 1
+v8_rows    = r8_signal + 1
+
+var table t = table.new(position.bottom_right, 2, v8_rows, border_width=1, bgcolor=color.rgb(12, 12, 22), border_color=color.rgb(55, 55, 75))
+
+if barstate.islast or barstate.isrealtime
+    table.cell(t, 0, 0, "V8 PRO DESK", text_color=c_txt, bgcolor=c_hdr, text_size=size.small)
+    table.cell(t, 1, 0, "KLSE",        text_color=c_txt, bgcolor=c_hdr, text_size=size.small)
+
+    table.cell(t, 0, r8_trend, "Trend D+W", text_color=c_sub, bgcolor=c_lbl, text_size=size.small)
+    table.cell(t, 1, r8_trend, trendConfirm ? "ALIGNED" : trend ? "DAY ONLY" : "NO TREND", text_color=c_txt, bgcolor=trendConfirm ? c_good : trend ? c_warn : c_bad, text_size=size.small)
+
+    table.cell(t, 0, r8_rs, "RS vs KLCI", text_color=c_sub, bgcolor=c_lbl, text_size=size.small)
+    table.cell(t, 1, r8_rs, rsConfirm ? "LEAD +" : rsLeading ? "LEAD" : "LAGGING", text_color=c_txt, bgcolor=rsConfirm ? c_good : rsLeading ? c_warn : c_bad, text_size=size.small)
+
+    if show_squeeze_row
+        table.cell(t, 0, r8_squeeze, "VCP Squeeze", text_color=c_sub, bgcolor=c_lbl, text_size=size.small)
+        table.cell(t, 1, r8_squeeze, accum ? "YES" : "NO", text_color=c_txt, bgcolor=accum ? c_good : c_neu, text_size=size.small)
+
+    // [v8-6] MCDX row
+    if show_mcdx_row
+        mcdx_str = "MCDX " + str.tostring(math.round(mcdx)) + (mcdxBull ? "  BULL" : "  BEAR")
+        table.cell(t, 0, r8_mcdx, "MCDX Smart Money", text_color=c_sub, bgcolor=c_lbl, text_size=size.small)
+        table.cell(t, 1, r8_mcdx, mcdx_str, text_color=c_txt, bgcolor=mcdxBull ? c_good : c_bad, text_size=size.small)
+
+    if show_volbrk_row
+        table.cell(t, 0, r8_volbrk, "Vol Breakout", text_color=c_sub, bgcolor=c_lbl, text_size=size.small)
+        table.cell(t, 1, r8_volbrk, volBreak ? "YES" : "NO", text_color=c_txt, bgcolor=volBreak ? c_good : c_neu, text_size=size.small)
+
+    if show_strike_row
+        table.cell(t, 0, r8_strike, "Strike Zone", text_color=c_sub, bgcolor=c_lbl, text_size=size.small)
+        table.cell(t, 1, r8_strike, strikeZone ? "IN ZONE" : "—", text_color=c_txt, bgcolor=strikeZone ? c_warn : c_neu, text_size=size.small)
+
+    if show_risk_row
+        risk_str = (riskOff ? "DEFENSE" : "NORMAL") + "  " + str.tostring(math.round(maxExposure * 100, 0)) + "%"
+        table.cell(t, 0, r8_risk, "Risk | Exposure", text_color=c_sub, bgcolor=c_lbl, text_size=size.small)
+        table.cell(t, 1, r8_risk, risk_str, text_color=c_txt, bgcolor=riskOff ? c_bad : c_neu, text_size=size.small)
+
+    // [v8-4] Stop mode row — always shown
+    stop_ema_str  = not na(stop_ema_val) ? str.tostring(math.round(stop_ema_val, 3)) : "--"
+    stop_mode_lbl = stop_mode == "Fundamental (EMA 200)" ? "EMA200 @ " + stop_ema_str : "EMA20 @ " + stop_ema_str
+    table.cell(t, 0, r8_stop, "Stop Mode", text_color=c_sub, bgcolor=c_lbl, text_size=size.small)
+    table.cell(t, 1, r8_stop, stop_mode_lbl, text_color=c_txt, bgcolor=hard_stop_hit ? c_bad : c_neu, text_size=size.small)
+
+    // Signal row — shows highest priority active state
+    exec_bg  = execute_plus ? c_good : execute ? color.rgb(10, 58, 58) : signal ? c_warn : coil_signal ? color.rgb(40, 10, 58) : c_neu
+    exec_txt = execute_plus ? "► EXECUTE+" : execute ? "► BUY" : signal ? "SETUP OK" : coil_signal ? "VCP COIL" : "WAIT"
+    table.cell(t, 0, r8_signal, "► SIGNAL", text_color=c_sub, bgcolor=c_lbl, text_size=size.small)
+    table.cell(t, 1, r8_signal, exec_txt,   text_color=c_txt, bgcolor=exec_bg, text_size=size.small)
+
+// ================================================================
+// 11. ALERTS [v7] + [v8-7]
+// ================================================================
+alertcondition(new_coil,                        title="VCP COIL — Prepare Entry",   message="V8 Pro Desk | {{ticker}} | VCP COIL: squeeze at max + volume at N-bar low. Breakout likely within 1-5 days.")
+alertcondition(execute_plus,                    title="EXECUTE+ High Conviction",   message="V8 Pro Desk | {{ticker}} | EXECUTE+ (Hammer at breakout) | Price={{close}}")
+alertcondition(execute and not execute_plus,    title="EXECUTE BUY Signal",         message="V8 Pro Desk | {{ticker}} | EXECUTE BUY | Price={{close}}")
+alertcondition(strikeZone,                      title="Strike Zone Pullback",       message="V8 Pro Desk | {{ticker}} in EMA20 sniper zone — ready your entry!")
+alertcondition(tp1_reached,                     title="TP1 Hit — Sell 1/3",         message="V8 Pro Desk | {{ticker}} | TP1 HIT: Sell 1/3. Trail stop activated.")
+alertcondition(tp2_reached,                     title="TP2 Hit — Sell 1/3",         message="V8 Pro Desk | {{ticker}} | TP2 HIT: Sell 1/3. Trail remainder.")
+alertcondition(trail_stop_hit or hard_stop_hit, title="EXIT SIGNAL",                message="V8 Pro Desk | {{ticker}} | EXIT | Price={{close}}")
+
+// ================================================================
+// END OF SCRIPT
+// ================================================================

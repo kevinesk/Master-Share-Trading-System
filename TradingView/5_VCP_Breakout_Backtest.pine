@@ -1,0 +1,43 @@
+//@version=5
+strategy("KLSE VCP Breakout Backtest", overlay=true,
+         initial_capital=50000,
+         default_qty_type=strategy.percent_of_equity,
+         default_qty_value=10,
+         commission_type=strategy.commission.percent,
+         commission_value=0.3)   // 0.3% round-trip est.
+
+// Inputs
+ema_fast = input.int(21, "Fast EMA")
+ema_slow = input.int(50, "Slow EMA")
+vol_mult = input.float(1.5, "Min Volume Multiple for Breakout")
+stop_pct = input.float(7.0, "Stop Loss %") / 100
+
+// Indicators
+fast = ta.ema(close, ema_fast)
+slow = ta.ema(close, ema_slow)
+vol_avg = ta.sma(volume, 20)
+
+// Trend filter
+in_uptrend = close > slow and slow > ta.ema(close, 150)
+
+// Breakout signal: new 20-day high with volume
+new_high = high == ta.highest(high, 20)
+vol_surging = volume >= vol_avg * vol_mult
+
+// Entry
+long_entry = in_uptrend and new_high and vol_surging
+if long_entry
+    strategy.entry("Long", strategy.long)
+
+// Exit: stop loss or EMA break
+stop_price = strategy.position_avg_price * (1 - stop_pct)
+ema_break  = close < fast
+
+if strategy.position_size > 0
+    strategy.exit("Stop", "Long", stop=stop_price)
+    if ema_break
+        strategy.close("Long", comment="EMA Break")
+
+// Plot
+plot(fast, color=color.purple, linewidth=1)
+plot(slow, color=color.blue, linewidth=2)

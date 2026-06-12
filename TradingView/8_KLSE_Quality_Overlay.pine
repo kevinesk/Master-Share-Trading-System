@@ -1,0 +1,193 @@
+//@version=5
+// ============================================================
+// 8_KLSE_Quality_Overlay — Phase 3 Specialty Indicator
+//
+// On-chart KLSE quality grade tag combining 4 master frameworks:
+//   • KC Chong 8-Criteria      (Knowledge Base file 53)
+//   • Cold Eye 8-Criteria      (file 57)
+//   • Tong Kooi Ong Tier 1-5   (file 56)
+//   • Tradeview MONEY Equation (file 54)
+//
+// Inputs are MANUAL (Pine cannot fetch klsescreener fundamentals).
+// Fill once per stock from your fundamentals_v2 JSON or annual report.
+// The indicator then plots:
+//   • Quality grade label (Q-ELITE / Q-A / Q-B / Q-C / Q-D)
+//   • Dashboard table showing all 4 sub-scores
+//   • Color tint on the price chart by quality tier
+//
+// Update inputs quarterly when results come out.
+// ============================================================
+indicator("8_KLSE_Quality_Overlay", overlay=true, max_labels_count=10)
+
+// ============================================================
+// 1. INPUTS — Pillar 1: KC Chong 8-Criteria (file 53)
+// ============================================================
+grp_kc = "KC Chong 8-Criteria (file 53)"
+kc1 = input.bool(false, "1. ROE 5yr avg ≥ 12%",        group=grp_kc)
+kc2 = input.bool(false, "2. EPS Growth 5yr CAGR ≥ 7%", group=grp_kc)
+kc3 = input.bool(false, "3. Debt/Equity ≤ 1.0",         group=grp_kc)
+kc4 = input.bool(false, "4. FCF positive ≥ 4/5 yrs",    group=grp_kc)
+kc5 = input.bool(false, "5. Dividend Yield ≥ 2%",       group=grp_kc)
+kc6 = input.bool(false, "6. P/E ≤ 20",                  group=grp_kc)
+kc7 = input.bool(false, "7. P/B ≤ 2.5",                 group=grp_kc)
+kc8 = input.bool(false, "8. EPS positive last yr",      group=grp_kc)
+
+// ============================================================
+// 2. INPUTS — Pillar 2: Cold Eye 8-Criteria (file 57)
+// ============================================================
+grp_ce = "Cold Eye 8-Criteria (file 57)"
+ce1 = input.bool(false, "1. Total Return (DY+EPSg) ≥ 8%", group=grp_ce)
+ce2 = input.bool(false, "2. ROE consistent ≥ 10%",        group=grp_ce)
+ce3 = input.bool(false, "3. Dividend track ≥ 5 yrs",      group=grp_ce)
+ce4 = input.bool(false, "4. DY ≥ 3%",                     group=grp_ce)
+ce5 = input.bool(false, "5. P/E ≤ 18",                    group=grp_ce)
+ce6 = input.bool(false, "6. P/B ≤ 2.0",                   group=grp_ce)
+ce7 = input.bool(false, "7. D/E ≤ 0.8",                   group=grp_ce)
+ce8 = input.bool(false, "8. Op Margin ≥ 10%",             group=grp_ce)
+
+// ============================================================
+// 3. INPUTS — Pillar 3: Tong Kooi Ong Quality Tier (file 56)
+// ============================================================
+grp_tk = "Tong Kooi Ong Tier (file 56)"
+tong_tier = input.string("T3-Decent", "Quality Tier",
+  options=["T1-Elite", "T2-Strong", "T3-Decent", "T4-Cyclical", "T5-Spec"], group=grp_tk,
+  tooltip="T1: PBBANK/NESTLE class. T2: TENAGA/IHH/AXIATA. T3: GAMUDA/IJM. T4: cyclicals. T5: spec.")
+
+// ============================================================
+// 4. INPUTS — Pillar 4: Tradeview MONEY Equation (file 54)
+// ============================================================
+grp_my = "Tradeview MONEY Equation (file 54)"
+money_m = input.int(0, "M — Management (0-3)",   minval=0, maxval=3, group=grp_my,
+  tooltip="3 if ROE ≥ 15% + strong governance. 2 if 10-15%. 1 if 5-10%. 0 otherwise.")
+money_o = input.int(0, "O — Operations (0-3)",   minval=0, maxval=3, group=grp_my,
+  tooltip="3 if Op Margin ≥ 15%. 2 if 10-15%. 1 if 5-10%. 0 otherwise.")
+money_n = input.int(0, "N — New Growth (0-2)",   minval=0, maxval=2, group=grp_my,
+  tooltip="2 if EPS CAGR ≥ 15%. 1 if ≥ 7%. 0 otherwise.")
+money_e = input.int(0, "E — Earnings (0-2)",     minval=0, maxval=2, group=grp_my,
+  tooltip="2 if EPS positive last yr. 0 if loss.")
+money_y = input.int(0, "Y — Yield (0-2)",        minval=0, maxval=2, group=grp_my,
+  tooltip="2 if DY ≥ 5%. 1 if ≥ 3%. 0 otherwise.")
+
+// ============================================================
+// 5. INPUTS — Display
+// ============================================================
+grp_disp = "Display"
+show_table   = input.bool(true, "Show Quality Dashboard (top-left)", group=grp_disp)
+show_chip    = input.bool(true, "Show Grade Chip on Chart",          group=grp_disp)
+tint_chart   = input.bool(false, "Tint background by Quality Grade", group=grp_disp,
+  tooltip="Subtle background color (green=Q-ELITE, red=Q-D).")
+
+// ============================================================
+// 6. SCORE CALCULATIONS
+// ============================================================
+// Pillar 1 — KC Chong
+kc_passed = (kc1 ? 1 : 0) + (kc2 ? 1 : 0) + (kc3 ? 1 : 0) + (kc4 ? 1 : 0) +
+            (kc5 ? 1 : 0) + (kc6 ? 1 : 0) + (kc7 ? 1 : 0) + (kc8 ? 1 : 0)
+kc_score = math.round(kc_passed * 14 / 8)
+
+// Pillar 2 — Cold Eye
+ce_passed = (ce1 ? 1 : 0) + (ce2 ? 1 : 0) + (ce3 ? 1 : 0) + (ce4 ? 1 : 0) +
+            (ce5 ? 1 : 0) + (ce6 ? 1 : 0) + (ce7 ? 1 : 0) + (ce8 ? 1 : 0)
+ce_score = math.round(ce_passed * 14 / 8)
+
+// Pillar 3 — Tong Kooi Ong
+tong_score =
+  tong_tier == "T1-Elite"    ? 10 :
+  tong_tier == "T2-Strong"   ? 8  :
+  tong_tier == "T3-Decent"   ? 5  :
+  tong_tier == "T4-Cyclical" ? 3  :
+  1
+
+// Pillar 4 — MONEY
+money_score = money_m + money_o + money_n + money_e + money_y
+
+// Composite
+quality_score = kc_score + ce_score + tong_score + money_score   // max 50
+
+quality_grade =
+  quality_score >= 40 ? "Q-ELITE" :
+  quality_score >= 30 ? "Q-A"     :
+  quality_score >= 20 ? "Q-B"     :
+  quality_score >= 10 ? "Q-C"     :
+  "Q-D"
+
+grade_color =
+  quality_grade == "Q-ELITE" ? color.new(#6610f2, 0)  :
+  quality_grade == "Q-A"     ? color.new(#198754, 0)  :
+  quality_grade == "Q-B"     ? color.new(#0d6efd, 0)  :
+  quality_grade == "Q-C"     ? color.new(#fd7e14, 0)  :
+  color.new(#dc3545, 0)
+
+grade_tint =
+  quality_grade == "Q-ELITE" ? color.new(#6610f2, 92) :
+  quality_grade == "Q-A"     ? color.new(#198754, 92) :
+  quality_grade == "Q-B"     ? color.new(#0d6efd, 94) :
+  quality_grade == "Q-C"     ? color.new(#fd7e14, 95) :
+  color.new(#dc3545, 95)
+
+action_text =
+  quality_grade == "Q-ELITE" ? "Core hold · Full 7% · Compound"  :
+  quality_grade == "Q-A"     ? "Full 7% size · Swing/position"   :
+  quality_grade == "Q-B"     ? "5% size · Technical must align"  :
+  quality_grade == "Q-C"     ? "Skip unless deep-value w/ stop"  :
+  "AVOID — never buy"
+
+// ============================================================
+// 7. CHART TINT
+// ============================================================
+bgcolor(tint_chart ? grade_tint : na, title="Quality Grade Tint")
+
+// ============================================================
+// 8. ON-CHART CHIP (last bar)
+// ============================================================
+if show_chip and barstate.islast
+    label.new(bar_index, high * 1.04,
+              "💎 " + quality_grade + "  " + str.tostring(quality_score) + "/50",
+              color=grade_color, textcolor=color.white,
+              style=label.style_label_down, size=size.large)
+
+// ============================================================
+// 9. DASHBOARD TABLE
+// ============================================================
+var table qt = table.new(position.top_left, 2, 9,
+                         bgcolor=color.new(color.black, 80),
+                         border_color=color.gray, border_width=1)
+
+f_qcell(int r, string lbl, string val, color valcol) =>
+    table.cell(qt, 0, r, lbl, text_color=color.silver,
+               bgcolor=color.new(color.black, 80), text_size=size.small,
+               text_halign=text.align_left)
+    table.cell(qt, 1, r, val, text_color=valcol,
+               bgcolor=color.new(color.black, 80), text_size=size.small,
+               text_halign=text.align_right)
+
+if show_table and barstate.islast
+    table.cell(qt, 0, 0, "KLSE QUALITY", text_color=color.yellow,
+               bgcolor=color.new(color.black, 60), text_size=size.normal)
+    table.cell(qt, 1, 0, "──────", text_color=color.yellow,
+               bgcolor=color.new(color.black, 60), text_size=size.small)
+
+    f_qcell(1, "KC Chong (file 53)", str.tostring(kc_passed) + "/8 → " + str.tostring(kc_score) + "/14",
+            kc_passed >= 6 ? color.lime : kc_passed >= 4 ? color.orange : color.red)
+    f_qcell(2, "Cold Eye (file 57)", str.tostring(ce_passed) + "/8 → " + str.tostring(ce_score) + "/14",
+            ce_passed >= 6 ? color.lime : ce_passed >= 4 ? color.orange : color.red)
+    f_qcell(3, "Tong Tier (file 56)", tong_tier + " → " + str.tostring(tong_score) + "/10",
+            tong_score >= 8 ? color.lime : tong_score >= 5 ? color.aqua : color.orange)
+    f_qcell(4, "MONEY (file 54)",
+            "M" + str.tostring(money_m) + "/O" + str.tostring(money_o) +
+            "/N" + str.tostring(money_n) + "/E" + str.tostring(money_e) + "/Y" + str.tostring(money_y) +
+            " → " + str.tostring(money_score) + "/12",
+            money_score >= 9 ? color.lime : money_score >= 6 ? color.aqua : color.orange)
+    f_qcell(5, "═══════════", "═══════════", color.gray)
+    f_qcell(6, "TOTAL SCORE", str.tostring(quality_score) + " / 50",
+            quality_score >= 30 ? color.lime : quality_score >= 20 ? color.aqua : color.red)
+    f_qcell(7, "GRADE", quality_grade, grade_color)
+    f_qcell(8, "ACTION", action_text, color.white)
+
+// ============================================================
+// 10. ALERTS
+// ============================================================
+alertcondition(quality_grade == "Q-ELITE",
+               title="Quality: Q-ELITE", message="Stock is Q-ELITE — full size core hold candidate")
+alertcondition(quality_grade == "Q-D",
+               title="Quality: Q-D — AVOID", message="Stock scored Q-D — do not buy")

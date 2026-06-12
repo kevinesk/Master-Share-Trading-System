@@ -1,0 +1,22 @@
+//@version=5
+indicator("BB Squeeze + Breakout", overlay=false)
+
+// Bollinger Bands
+length = input.int(20, "BB Length")
+mult   = input.float(2.0, "BB Multiplier")
+
+[upper, basis, lower] = ta.bb(close, length, mult)
+bb_width = (upper - lower) / basis * 100
+
+// Squeeze: bandwidth at 6-month low
+squeeze = bb_width == ta.lowest(bb_width, 126)
+
+// Keltner Channels (for squeeze filter)
+kc_mult  = input.float(1.5, "KC Mult")
+kc_upper = basis + ta.atr(length) * kc_mult
+kc_lower = basis - ta.atr(length) * kc_mult
+in_squeeze = upper < kc_upper and lower > kc_lower
+
+// Plot
+plot(bb_width, title="BB Width %", color=in_squeeze ? color.red : color.blue)
+bgcolor(squeeze ? color.new(color.red, 85) : na, title="Squeeze Alert")

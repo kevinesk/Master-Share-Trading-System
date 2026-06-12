@@ -1,0 +1,224 @@
+//@version=5
+// ================================================================
+// V9 Pro Quant Desk (KLSE) — Phase 2 Enhancements Overlay
+// Companion to V8: adds new layers from Knowledge Base files 43-57
+//
+// NEW IN V9 (run this INDICATOR alongside V8 on the same chart):
+//   [v9-1]  Weinstein Stage Analysis (file 44) — Stage 1/2/3/4 via 30W MA
+//   [v9-2]  Marks Cycle Score (file 43) — manual input drives bias
+//   [v9-3]  Stovall Sector Phase (file 45) — manual input + favored-sector check
+//   [v9-4]  Position Size Calculator — uses portfolio + entry to suggest units
+//   [v9-5]  Anti-FOMO Extension Warning (STICKY_NOTE_Anti_FOMO.md) — >1% past pivot
+//   [v9-6]  Master Decision Tree quick-gate summary (PRE_TRADE_CHECKLIST.md)
+//   [v9-7]  Dual-Style Bucket suggestion (A momentum / B yield / hybrid)
+// ================================================================
+indicator("V9 Pro Quant Desk (KLSE) — Phase 2 Enhancements",
+          overlay=true, max_labels_count=100, max_lines_count=10)
+
+// ================================================================
+// 1. INPUTS
+// ================================================================
+grp_v9    = "V9 — Macro Context (manual)"
+marks_score    = input.int(5,  "Marks Cycle Score (1-10)",     minval=1, maxval=10, group=grp_v9,
+  tooltip="1 = max fear, 5-6 = neutral, 10 = max euphoria. Drives sizing bias.")
+stovall_phase  = input.string("Early Recovery",
+  "Stovall Economic Phase", group=grp_v9,
+  options=["Early Recovery", "Full Recovery", "Early Slowdown", "Recession"],
+  tooltip="Determines favored sectors per Stovall framework.")
+liquidity_tone = input.string("Expanding",
+  "Liquidity Tone (Dalio)", options=["Expanding","Tight","Neutral"], group=grp_v9,
+  tooltip="Expanding = rate cuts / MYR firming. Tight = hikes / MYR weakening.")
+
+grp_sec   = "V9 — Sector Tag (for Stovall check)"
+sector    = input.string("Banking",
+  "This Stock's Sector", group=grp_sec,
+  options=["Banking","Construction","Property","Tech","Healthcare","Plantation",
+           "Consumer","Energy","Industrial","Utilities","Telco","REIT"])
+
+grp_size  = "V9 — Position Sizing"
+portfolio_rm = input.float(30000.0, "Portfolio Value (RM)", minval=1000, step=1000, group=grp_size)
+max_pos_pct  = input.float(10.0,    "Max Position % of Portfolio", minval=1, maxval=20, step=1, group=grp_size)
+tgt_pos_pct  = input.float(7.0,     "Target Position %",          minval=1, maxval=15, step=1, group=grp_size)
+risk_per_trd = input.float(1.0,     "Max Risk per Trade %",       minval=0.5, maxval=3, step=0.1, group=grp_size)
+stop_dist_p  = input.float(5.0,     "Assumed Stop Distance %",    minval=1, maxval=15, step=0.5, group=grp_size)
+
+grp_fomo  = "V9 — Anti-FOMO"
+fomo_extend_pct = input.float(1.0, "FOMO if price > N% above pivot", minval=0.5, maxval=5, step=0.1, group=grp_fomo)
+
+grp_disp9 = "V9 — Display"
+show_v9_table = input.bool(true, "Show V9 Dashboard (top-right)", group=grp_disp9)
+show_fomo_lbl = input.bool(true, "Show FOMO warning label",       group=grp_disp9)
+show_weinstein = input.bool(true, "Show Weinstein Stage marker",  group=grp_disp9)
+
+// Table colours (customisable) — solid backgrounds for readability
+grp_tblcol = "V9 — Table Colours"
+tbl_bg        = input.color(#0a0e27,        "Table Background",     group=grp_tblcol)
+tbl_hdr_bg    = input.color(#16213e,        "Header Background",    group=grp_tblcol)
+tbl_lbl_txt   = input.color(color.white,    "Label Text",          group=grp_tblcol)
+tbl_hdr_txt   = input.color(color.yellow,   "Header Text",         group=grp_tblcol)
+tbl_text_size = input.string("Normal",      "Text Size", options=["Small","Normal","Large"], group=grp_tblcol)
+v9_txt_size = tbl_text_size == "Small" ? size.small : tbl_text_size == "Large" ? size.large : size.normal
+
+// ================================================================
+// 2. WEINSTEIN STAGE ANALYSIS (file 44)
+// ================================================================
+// Daily 150 EMA ≈ 30-week MA (5 trading days × 30 weeks = 150)
+ema30W       = ta.ema(close, 150)
+ema30W_slope = ema30W > ema30W[20]   // rising over 20 bars = ~4 weeks
+ema30W_flat  = math.abs(ema30W - ema30W[20]) / ema30W < 0.01
+
+stage_label =
+  close < ema30W and not ema30W_slope ? "4-DOWNTREND" :
+  close > ema30W and ema30W_slope     ? "2-UPTREND"   :
+  close > ema30W and ema30W_flat      ? "3-TOPPING"   :
+  close < ema30W and ema30W_flat      ? "1-BASE"      :
+  close > ema30W and not ema30W_slope ? "3-TOPPING"   :
+  "1-BASE"
+
+stage_color = stage_label == "2-UPTREND"   ? color.green :
+              stage_label == "1-BASE"      ? color.orange :
+              stage_label == "3-TOPPING"   ? color.red :
+              color.gray
+
+// Plot 30W EMA
+plot(ema30W, "30W EMA (Weinstein)", color=stage_color, linewidth=2)
+
+// ================================================================
+// 3. STOVALL SECTOR PHASE CHECK (file 45)
+// ================================================================
+favored = false
+if stovall_phase == "Early Recovery"
+    favored := sector == "Banking" or sector == "Construction" or sector == "Property" or sector == "Industrial"
+if stovall_phase == "Full Recovery"
+    favored := sector == "Tech" or sector == "Consumer" or sector == "Industrial"
+if stovall_phase == "Early Slowdown"
+    favored := sector == "Energy" or sector == "Healthcare" or sector == "Consumer"
+if stovall_phase == "Recession"
+    favored := sector == "Utilities" or sector == "Healthcare" or sector == "Telco" or sector == "REIT"
+
+stovall_tag = favored ? "✓ FAVORED" : "✗ NOT FAVORED"
+stovall_col = favored ? color.lime : color.red
+
+// ================================================================
+// 4. DUAL-STYLE BUCKET ASSIGNMENT (DUAL_STYLE_PLAYBOOK.md)
+// ================================================================
+// Bucket A — momentum/growth proxy: Stage 2 + low volatility hint
+// Bucket B — yield/defensive: relevant sectors
+bucket =
+  sector == "Banking" or sector == "Utilities" or sector == "REIT" or sector == "Telco" ? "B-Yield" :
+  (sector == "Tech" or sector == "Consumer") and stage_label == "2-UPTREND" ? "A-Momentum" :
+  stage_label == "2-UPTREND" ? "A-Momentum" :
+  "Hybrid"
+
+// ================================================================
+// 5. POSITION SIZE CALCULATION
+// ================================================================
+entry_price  = close
+max_units    = math.floor((portfolio_rm * max_pos_pct / 100) / entry_price / 100) * 100
+target_units = math.floor((portfolio_rm * tgt_pos_pct / 100) / entry_price / 100) * 100
+risk_rm      = portfolio_rm * risk_per_trd / 100
+risk_per_sh  = entry_price * (stop_dist_p / 100)
+risk_units   = risk_per_sh > 0 ? math.floor((risk_rm / risk_per_sh) / 100) * 100 : 0
+final_units  = math.min(math.min(max_units, target_units > 0 ? target_units : max_units), risk_units > 0 ? risk_units : max_units)
+final_cost   = final_units * entry_price
+final_pct    = portfolio_rm > 0 ? (final_cost / portfolio_rm) * 100 : 0
+
+// ================================================================
+// 6. ANTI-FOMO PIVOT EXTENSION CHECK
+// ================================================================
+// Find recent pivot — highest high in last 15 bars (excluding current)
+pivot_price = ta.highest(high, 15)[1]
+dist_pivot  = pivot_price > 0 ? ((close / pivot_price) - 1) * 100 : 0
+fomo_warn   = dist_pivot > fomo_extend_pct
+fomo_text =
+  dist_pivot > 3.0  ? "🔴 EXTENDED — DO NOT CHASE" :
+  dist_pivot > fomo_extend_pct ? "🟡 LATE — small tranche only" :
+  dist_pivot >= -1.0 ? "🟢 BUY ZONE" :
+  "⏳ BELOW PIVOT"
+
+// FOMO label on chart (last bar only)
+if show_fomo_lbl and barstate.islast and fomo_warn
+    label.new(bar_index, high * 1.02, fomo_text,
+              color=color.new(color.red, 20), textcolor=color.white,
+              style=label.style_label_down, size=size.normal)
+
+// Weinstein stage marker on chart
+if show_weinstein and barstate.islast
+    label.new(bar_index, low * 0.98, "Stage " + stage_label,
+              color=color.new(stage_color, 30), textcolor=color.white,
+              style=label.style_label_up, size=size.small)
+
+// ================================================================
+// 7. MARKS CYCLE SIZING BIAS
+// ================================================================
+marks_bias =
+  marks_score <= 3 ? "🔴 EXTREME FEAR — Defensive/Cash" :
+  marks_score <= 6 ? "🟢 NORMAL — Active deploy" :
+  marks_score <= 8 ? "🟡 ELEVATED — Trim & trail" :
+  "🔴 EUPHORIA — Raise cash 30-50%"
+
+size_multiplier =
+  marks_score <= 3 ? 0.5 :
+  marks_score <= 6 ? 1.0 :
+  marks_score <= 8 ? 0.7 :
+  0.3
+
+adjusted_units = math.floor(final_units * size_multiplier / 100) * 100
+adjusted_cost  = adjusted_units * entry_price
+adjusted_pct   = portfolio_rm > 0 ? (adjusted_cost / portfolio_rm) * 100 : 0
+
+// ================================================================
+// 8. DECISION TREE QUICK GATES (PRE_TRADE_CHECKLIST.md compressed)
+// ================================================================
+gate1_market    = marks_score >= 3 and marks_score <= 8
+gate2_sector    = favored
+gate3_stage     = stage_label == "2-UPTREND"
+gate4_fomo      = not fomo_warn
+gate5_size      = adjusted_units >= 100 and adjusted_pct <= max_pos_pct
+gate6_liquidity = liquidity_tone == "Expanding" or liquidity_tone == "Neutral"
+
+gates_passed = (gate1_market ? 1 : 0) + (gate2_sector ? 1 : 0) +
+               (gate3_stage ? 1 : 0)  + (gate4_fomo ? 1 : 0) +
+               (gate5_size ? 1 : 0)   + (gate6_liquidity ? 1 : 0)
+gate_verdict =
+  gates_passed == 6 ? "🟢 ALL 6/6 — EXECUTE" :
+  gates_passed >= 5 ? "🟡 5/6 — Review red gate" :
+  gates_passed >= 3 ? "🟠 " + str.tostring(gates_passed) + "/6 — Marginal" :
+  "🔴 " + str.tostring(gates_passed) + "/6 — SKIP"
+
+// ================================================================
+// 9. V9 DASHBOARD (top-right)
+// ================================================================
+var table v9tbl = table.new(position.top_right, 2, 14, bgcolor=tbl_bg, border_color=color.new(color.gray, 40), border_width=1, frame_color=color.new(color.gray, 20), frame_width=1)
+
+f_cell(int r, string lbl, string val, color valcol) =>
+    table.cell(v9tbl, 0, r, lbl, text_color=tbl_lbl_txt, bgcolor=tbl_bg, text_size=v9_txt_size, text_halign=text.align_left)
+    table.cell(v9tbl, 1, r, val, text_color=valcol, bgcolor=tbl_bg, text_size=v9_txt_size, text_halign=text.align_right)
+
+if show_v9_table and barstate.islast
+    table.cell(v9tbl, 0, 0, "V9 PHASE 2 LAYERS", text_color=tbl_hdr_txt, bgcolor=tbl_hdr_bg, text_size=v9_txt_size, text_halign=text.align_left)
+    table.cell(v9tbl, 1, 0, "──────", text_color=tbl_hdr_txt, bgcolor=tbl_hdr_bg, text_size=v9_txt_size, text_halign=text.align_right)
+
+    f_cell(1, "Weinstein Stage", stage_label, stage_color)
+    f_cell(2, "Marks Score (1-10)", str.tostring(marks_score), marks_score >= 3 and marks_score <= 7 ? color.lime : color.orange)
+    f_cell(3, "Marks Bias", marks_bias, color.white)
+    f_cell(4, "Stovall Phase", stovall_phase, color.white)
+    f_cell(5, "Sector " + sector, stovall_tag, stovall_col)
+    f_cell(6, "Liquidity", liquidity_tone, liquidity_tone == "Expanding" ? color.lime : liquidity_tone == "Tight" ? color.red : color.silver)
+    f_cell(7, "Bucket Suggested", bucket, color.aqua)
+    f_cell(8, "Pivot (15b)", str.tostring(pivot_price, "#.####"), color.white)
+    f_cell(9, "Dist vs Pivot", str.tostring(dist_pivot, "#.##") + "%", fomo_warn ? color.red : color.lime)
+    f_cell(10, "FOMO Check", fomo_text, fomo_warn ? color.red : color.lime)
+    f_cell(11, "Size (raw)", str.tostring(final_units) + " (" + str.tostring(final_pct, "#.#") + "%)", color.white)
+    f_cell(12, "Size (Marks adj)", str.tostring(adjusted_units) + " (" + str.tostring(adjusted_pct, "#.#") + "%)", color.aqua)
+    f_cell(13, "Gate Verdict (6)", gate_verdict, gates_passed >= 5 ? color.lime : gates_passed >= 3 ? color.orange : color.red)
+
+// ================================================================
+// 10. ALERTS
+// ================================================================
+alertcondition(gate1_market and gate2_sector and gate3_stage and gate4_fomo and gate5_size and gate6_liquidity and not gate1_market[1],
+               title="V9 ALL GATES GREEN", message="6/6 gates green — execute per V8 signal")
+alertcondition(fomo_warn and not fomo_warn[1],
+               title="V9 FOMO EXTENSION", message="Price extended >1% past 15b pivot — do not chase")
+alertcondition(stage_label == "2-UPTREND" and stage_label[1] != "2-UPTREND",
+               title="V9 WEINSTEIN STAGE 2", message="Stock entered Stage 2 uptrend (30W MA cross + rising)")

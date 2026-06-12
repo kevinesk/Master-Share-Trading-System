@@ -1,0 +1,63 @@
+//@version=5
+indicator("KLSE Intraday Execution Helper", overlay=true)
+
+// ════════════════════════════════════════════════════════════════════
+// FOR THE 5-MIN / 15-MIN CHART ON BREAKOUT DAY ONLY.
+// This does NOT find setups — the daily "KLSE VCP Stage v2" does that.
+// This just helps you EXECUTE the entry cleanly once a daily stock is
+// breaking out: VWAP, intraday EMAs, the opening range, and a buy-zone
+// band you set from the daily pivot price.
+// ════════════════════════════════════════════════════════════════════
+
+// ─── Inputs ───
+pivotPrice = input.float(0.0, "Daily pivot price (copy from screener; 0 = off)", step=0.001)
+buyZonePct = input.float(3.0, "Buy zone % above pivot")
+orSession  = input.session("0900-0930", "Opening range session (KLSE morning)")
+showOR     = input.bool(true, "Show opening range")
+
+// ─── VWAP + intraday EMAs ───
+vwapLine = ta.vwap
+e9  = ta.ema(close, 9)
+e21 = ta.ema(close, 21)
+
+plot(vwapLine, "VWAP",   color=color.new(color.orange, 0), linewidth=2)
+plot(e9,  "EMA 9",  color=color.new(color.aqua, 0))
+plot(e21, "EMA 21", color=color.new(color.blue, 0))
+
+// ─── Opening range (first 30 min of the KLSE morning session) ───
+inOR   = not na(time(timeframe.period, orSession))
+newDay = ta.change(time("D")) != 0
+var float orHigh = na
+var float orLow  = na
+if newDay
+    orHigh := na
+    orLow  := na
+if inOR
+    orHigh := na(orHigh) ? high : math.max(orHigh, high)
+    orLow  := na(orLow)  ? low  : math.min(orLow, low)
+
+plot(showOR ? orHigh : na, "Opening Range High", color=color.new(color.purple, 0),  linewidth=1, style=plot.style_linebr)
+plot(showOR ? orLow  : na, "Opening Range Low",  color=color.new(color.purple, 45), linewidth=1, style=plot.style_linebr)
+
+// ─── Daily pivot + buy-zone band ───
+hasPivot = pivotPrice > 0
+pv = plot(hasPivot ? pivotPrice : na, "Daily Pivot", color=color.new(color.blue, 0), linewidth=2, style=plot.style_linebr)
+bz = plot(hasPivot ? pivotPrice * (1 + buyZonePct / 100) : na, "Buy Zone Top", color=color.new(color.green, 30), linewidth=1, style=plot.style_linebr)
+fill(pv, bz, color=color.new(color.green, 90), title="Buy Zone")
+
+// ─── Signals ───
+crossedPivot = hasPivot and ta.crossover(close, pivotPrice)
+aboveVwap    = close > vwapLine
+inBuyZone    = hasPivot and close >= pivotPrice and close <= pivotPrice * (1 + buyZonePct / 100)
+extended     = hasPivot and close > pivotPrice * (1 + buyZonePct / 100)
+
+// ─── Status label (current bar only) ───
+s1 = "VWAP: " + (aboveVwap ? "ABOVE - ok" : "below - weak")
+s2 = hasPivot ? "  Pivot " + str.tostring(pivotPrice, "#.###") : "  (set the daily pivot price)"
+s3 = inBuyZone ? "  IN BUY ZONE - execute" : extended ? "  EXTENDED - do NOT chase" : hasPivot ? "  below pivot - wait for break" : ""
+lblCol = inBuyZone ? color.green : extended ? color.red : color.gray
+if barstate.islast
+    label.new(bar_index, high, s1 + s2 + s3, style=label.style_label_left, color=lblCol, textcolor=color.white, size=size.normal)
+
+// ─── Alert ───
+alertcondition(crossedPivot and aboveVwap, "Intraday Pivot Break", "{{ticker}} crossed the daily pivot and is above VWAP - execute within the buy zone")

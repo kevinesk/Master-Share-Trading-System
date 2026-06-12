@@ -1,0 +1,44 @@
+//@version=5
+// ============================================================
+// RS vs KLCI — Watchlist Column
+// Plots a stock's relative strength vs FBMKLCI over N days.
+// Use: add to chart, then in Watchlist → right-click column header →
+//      Customize columns → enable "RS vs KLCI"
+// Now every stock in your watchlist shows its RS value as a sortable column.
+// ============================================================
+indicator("RS vs KLCI 63d", overlay=false, format=format.percent, precision=1)
+
+lookback  = input.int(63, "Lookback (trading days)", minval=20, maxval=252,
+  tooltip="63 ≈ 3 months. Minervini's preferred RS window.")
+benchmark = input.symbol("FTSEMYX:FBMKLCI", "Benchmark")
+
+bench_close = request.security(benchmark, "D", close)
+
+stock_chg = (close / close[lookback] - 1) * 100
+bench_chg = (bench_close / bench_close[lookback] - 1) * 100
+rs_outperf = stock_chg - bench_chg
+
+// Color-code by tier
+rs_col = rs_outperf >= 50 ? color.new(#00ff00, 0) :    // top 1%
+         rs_outperf >= 30 ? color.new(#66cc66, 0) :    // top 10%
+         rs_outperf >= 10 ? color.new(#aabb44, 0) :    // top 25%
+         rs_outperf >= -10 ? color.new(color.gray, 0) :// middle
+                              color.new(color.red, 0)  // laggard
+
+plot(rs_outperf, "RS vs KLCI", color=rs_col, linewidth=2)
+hline(50, "Top 1% threshold",  color=color.new(color.green, 50), linestyle=hline.style_dashed)
+hline(30, "Top 10% threshold", color=color.new(color.olive, 50), linestyle=hline.style_dashed)
+hline(0,  "Even with KLCI",     color=color.new(color.gray, 50))
+hline(-10,"Laggard threshold", color=color.new(color.red, 50), linestyle=hline.style_dashed)
+
+// Tier label for quick read
+tier = rs_outperf >= 50 ? "🟢 TOP 1%" :
+       rs_outperf >= 30 ? "🟢 TOP 10%" :
+       rs_outperf >= 10 ? "🟡 TOP 25%" :
+       rs_outperf >= -10 ? "⚪ AVG" :
+                            "🔴 LAGGARD"
+
+var table tbl = table.new(position.top_right, 1, 2, border_width=1, frame_color=color.gray)
+if barstate.islast
+    table.cell(tbl, 0, 0, "RS " + str.tostring(lookback) + "d", bgcolor=#16213e, text_color=color.white, text_size=size.normal)
+    table.cell(tbl, 0, 1, str.tostring(rs_outperf, "+#.#;-#.#") + "%  " + tier, bgcolor=rs_col, text_color=color.white, text_size=size.large)

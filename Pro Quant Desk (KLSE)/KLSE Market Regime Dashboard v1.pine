@@ -1,0 +1,154 @@
+//@version=5
+indicator("KLSE Market Regime Dashboard v1", overlay=true)
+
+// ============================================================
+//  KLSE MARKET REGIME DASHBOARD — companion to VCP MSS v8
+//  Apply on FBMKLCI chart (or any KLSE stock — uses requests)
+//  Purpose: one-screen GO / NO-GO read for daily KLSE hunting
+// ============================================================
+
+// ---------- Inputs ----------
+grpMacro     = "Macro Benchmarks"
+sym_klci     = input.symbol("FTSEMYX:FBMKLCI",    "KLSE Benchmark",  group=grpMacro)
+sym_dow      = input.symbol("DJ:DJI",             "US Benchmark (Dow)", group=grpMacro)
+sym_spx      = input.symbol("SP:SPX",             "US Risk (SPX)",   group=grpMacro)
+sym_vix      = input.symbol("CBOE:VIX",           "Volatility",      group=grpMacro)
+
+grpSect      = "KLSE Sector Proxies (large-cap leaders — edit freely)"
+sym_bank     = input.symbol("MYX:1155",  "Banking (Maybank)",       group=grpSect)
+sym_tech     = input.symbol("MYX:0166",  "Technology (Inari)",      group=grpSect)
+sym_prop     = input.symbol("MYX:5288",  "Property (SimeProp)",     group=grpSect)
+sym_cons     = input.symbol("MYX:4707",  "Consumer (Nestle)",       group=grpSect)
+sym_plnt     = input.symbol("MYX:2445",  "Plantation (KLK)",        group=grpSect)
+sym_indus    = input.symbol("MYX:4197",  "Industrial (Sime Darby)", group=grpSect)
+sym_egy      = input.symbol("MYX:5183",  "Energy (PChem)",          group=grpSect)
+sym_hlth     = input.symbol("MYX:5225",  "Healthcare (IHH)",        group=grpSect)
+
+grpUI        = "Dashboard"
+tblPos       = input.string("top_right", "Position",
+                 options=["top_right","top_left","bottom_right","bottom_left","middle_right"], group=grpUI)
+txtSize      = input.string("normal", "Text Size",
+                 options=["tiny","small","normal","large"], group=grpUI)
+showSectors  = input.bool(true, "Show Sector RS", group=grpUI)
+
+// ---------- Helpers ----------
+f_close(sym) => request.security(sym, "D", close, ignore_invalid_symbol=true)
+f_ema(sym,len) => request.security(sym, "D", ta.ema(close, len), ignore_invalid_symbol=true)
+f_rs(sym, bench, lb) =>
+    s = request.security(sym,   "D", close, ignore_invalid_symbol=true)
+    b = request.security(bench, "D", close, ignore_invalid_symbol=true)
+    sChg = na(s) or na(s[lb]) ? na : (s / s[lb] - 1.0) * 100
+    bChg = na(b) or na(b[lb]) ? na : (b / b[lb] - 1.0) * 100
+    na(sChg) or na(bChg) ? na : sChg - bChg
+
+// ---------- Macro pillar (KLCI) ----------
+klci_c   = f_close(sym_klci)
+klci_e20 = f_ema(sym_klci, 20)
+klci_e50 = f_ema(sym_klci, 50)
+klci_e200= f_ema(sym_klci, 200)
+klci_bull  = klci_c > klci_e20 and klci_e20 > klci_e50 and klci_e50 > klci_e200
+klci_bear  = klci_c < klci_e20 and klci_e20 < klci_e50 and klci_e50 < klci_e200
+klci_trend = klci_bull ? "BULL" : klci_bear ? "BEAR" : "MIXED"
+klci_col   = klci_bull ? color.new(color.green, 0) : klci_bear ? color.new(color.red, 0) : color.new(color.orange, 0)
+
+// ---------- Dow pillar ----------
+dow_c   = f_close(sym_dow)
+dow_e50 = f_ema(sym_dow, 50)
+dow_e200= f_ema(sym_dow, 200)
+dow_bull  = dow_c > dow_e50 and dow_e50 > dow_e200
+dow_bear  = dow_c < dow_e50 and dow_e50 < dow_e200
+dow_trend = dow_bull ? "BULL" : dow_bear ? "BEAR" : "MIXED"
+dow_col   = dow_bull ? color.new(color.green, 0) : dow_bear ? color.new(color.red, 0) : color.new(color.orange, 0)
+
+// ---------- VIX regime ----------
+vix_c    = f_close(sym_vix)
+vix_state = vix_c < 16 ? "CALM" : vix_c < 22 ? "NORMAL" : vix_c < 30 ? "ELEVATED" : "PANIC"
+vix_col   = vix_c < 16 ? color.new(color.green, 0) : vix_c < 22 ? color.new(color.olive, 0) : vix_c < 30 ? color.new(color.orange, 0) : color.new(color.red, 0)
+
+// ---------- Breadth proxy: KLCI vs its EMA50 slope + % above EMA50 (lite McClellan proxy) ----------
+klci_slope = (klci_e50 - klci_e50[10]) / klci_e50[10] * 100
+breadth_state = klci_slope > 0.5 ? "EXPANDING" : klci_slope < -0.5 ? "CONTRACTING" : "FLAT"
+breadth_col   = klci_slope > 0.5 ? color.new(color.green, 0) : klci_slope < -0.5 ? color.new(color.red, 0) : color.new(color.orange, 0)
+
+// ---------- SPX risk-on confirmation ----------
+spx_c   = f_close(sym_spx)
+spx_e50 = f_ema(sym_spx, 50)
+spx_state = spx_c > spx_e50 ? "RISK-ON" : "RISK-OFF"
+spx_col   = spx_c > spx_e50 ? color.new(color.green, 0) : color.new(color.red, 0)
+
+// ---------- Composite gate ----------
+macro_go = klci_trend == "BULL" and dow_trend != "BEAR" and vix_c < 22 and breadth_state != "CONTRACTING"
+macro_warn = klci_trend == "MIXED" or breadth_state == "FLAT"
+gate_txt = macro_go ? "GREEN — HUNT LONGS" : macro_warn ? "AMBER — SELECTIVE" : "RED — STAND DOWN"
+gate_col = macro_go ? color.new(color.green, 0) : macro_warn ? color.new(color.orange, 0) : color.new(color.red, 0)
+
+// ---------- Sector RS (20-bar vs KLCI) ----------
+rs_lb = 20
+rs_bank  = f_rs(sym_bank,  sym_klci, rs_lb)
+rs_tech  = f_rs(sym_tech,  sym_klci, rs_lb)
+rs_prop  = f_rs(sym_prop,  sym_klci, rs_lb)
+rs_cons  = f_rs(sym_cons,  sym_klci, rs_lb)
+rs_plnt  = f_rs(sym_plnt,  sym_klci, rs_lb)
+rs_indus = f_rs(sym_indus, sym_klci, rs_lb)
+rs_egy   = f_rs(sym_egy,   sym_klci, rs_lb)
+rs_hlth  = f_rs(sym_hlth,  sym_klci, rs_lb)
+
+f_rscol(v) => na(v) ? color.new(color.gray, 50) : v > 1.5 ? color.new(color.green, 0) : v > 0.0 ? color.new(color.olive, 0) : v > -1.5 ? color.new(color.orange, 0) : color.new(color.red, 0)
+f_rstxt(v) => na(v) ? "n/a" : (v >= 0 ? "+" : "") + str.tostring(v, "#.#") + "%"
+
+// ---------- Render table ----------
+var table dash = na
+if barstate.islast
+    pos = tblPos == "top_right" ? position.top_right : tblPos == "top_left" ? position.top_left : tblPos == "bottom_right" ? position.bottom_right : tblPos == "bottom_left" ? position.bottom_left : position.middle_right
+    sz  = txtSize == "tiny" ? size.tiny : txtSize == "small" ? size.small : txtSize == "large" ? size.large : size.normal
+
+    rows = showSectors ? 16 : 8
+    dash := table.new(pos, 2, rows, border_width=1, frame_color=color.gray, frame_width=1)
+
+    // Header
+    table.cell(dash, 0, 0, "KLSE MARKET REGIME", bgcolor=color.new(color.navy, 0), text_color=color.white, text_size=sz)
+    table.cell(dash, 1, 0, gate_txt,             bgcolor=gate_col,                 text_color=color.white, text_size=sz)
+
+    // Macro rows
+    table.cell(dash, 0, 1, "FBM KLCI Trend",  bgcolor=color.new(color.gray, 80), text_size=sz)
+    table.cell(dash, 1, 1, klci_trend,        bgcolor=klci_col, text_color=color.white, text_size=sz)
+
+    table.cell(dash, 0, 2, "KLCI Slope (10d)", bgcolor=color.new(color.gray, 80), text_size=sz)
+    table.cell(dash, 1, 2, str.tostring(klci_slope, "#.##") + "%  " + breadth_state, bgcolor=breadth_col, text_color=color.white, text_size=sz)
+
+    table.cell(dash, 0, 3, "Dow Trend",       bgcolor=color.new(color.gray, 80), text_size=sz)
+    table.cell(dash, 1, 3, dow_trend,         bgcolor=dow_col, text_color=color.white, text_size=sz)
+
+    table.cell(dash, 0, 4, "SPX Risk",        bgcolor=color.new(color.gray, 80), text_size=sz)
+    table.cell(dash, 1, 4, spx_state,         bgcolor=spx_col, text_color=color.white, text_size=sz)
+
+    table.cell(dash, 0, 5, "VIX",             bgcolor=color.new(color.gray, 80), text_size=sz)
+    table.cell(dash, 1, 5, str.tostring(vix_c, "#.#") + "  " + vix_state, bgcolor=vix_col, text_color=color.white, text_size=sz)
+
+    table.cell(dash, 0, 6, "KLCI Close",      bgcolor=color.new(color.gray, 80), text_size=sz)
+    table.cell(dash, 1, 6, str.tostring(klci_c, "#.##"), bgcolor=color.new(color.black, 80), text_color=color.white, text_size=sz)
+
+    table.cell(dash, 0, 7, "─ SECTOR RS (20d vs KLCI) ─", bgcolor=color.new(color.navy, 30), text_color=color.white, text_size=sz)
+    table.cell(dash, 1, 7, "",                bgcolor=color.new(color.navy, 30), text_size=sz)
+
+    if showSectors
+        table.cell(dash, 0, 8,  "Banking",      bgcolor=color.new(color.gray, 80), text_size=sz)
+        table.cell(dash, 1, 8,  f_rstxt(rs_bank),  bgcolor=f_rscol(rs_bank),  text_color=color.white, text_size=sz)
+        table.cell(dash, 0, 9,  "Technology",   bgcolor=color.new(color.gray, 80), text_size=sz)
+        table.cell(dash, 1, 9,  f_rstxt(rs_tech),  bgcolor=f_rscol(rs_tech),  text_color=color.white, text_size=sz)
+        table.cell(dash, 0, 10, "Property",     bgcolor=color.new(color.gray, 80), text_size=sz)
+        table.cell(dash, 1, 10, f_rstxt(rs_prop),  bgcolor=f_rscol(rs_prop),  text_color=color.white, text_size=sz)
+        table.cell(dash, 0, 11, "Consumer",     bgcolor=color.new(color.gray, 80), text_size=sz)
+        table.cell(dash, 1, 11, f_rstxt(rs_cons),  bgcolor=f_rscol(rs_cons),  text_color=color.white, text_size=sz)
+        table.cell(dash, 0, 12, "Plantation",   bgcolor=color.new(color.gray, 80), text_size=sz)
+        table.cell(dash, 1, 12, f_rstxt(rs_plnt),  bgcolor=f_rscol(rs_plnt),  text_color=color.white, text_size=sz)
+        table.cell(dash, 0, 13, "Industrial",   bgcolor=color.new(color.gray, 80), text_size=sz)
+        table.cell(dash, 1, 13, f_rstxt(rs_indus), bgcolor=f_rscol(rs_indus), text_color=color.white, text_size=sz)
+        table.cell(dash, 0, 14, "Energy",       bgcolor=color.new(color.gray, 80), text_size=sz)
+        table.cell(dash, 1, 14, f_rstxt(rs_egy),   bgcolor=f_rscol(rs_egy),   text_color=color.white, text_size=sz)
+        table.cell(dash, 0, 15, "Healthcare",   bgcolor=color.new(color.gray, 80), text_size=sz)
+        table.cell(dash, 1, 15, f_rstxt(rs_hlth),  bgcolor=f_rscol(rs_hlth),  text_color=color.white, text_size=sz)
+
+// ---------- Alerts ----------
+alertcondition(macro_go and not macro_go[1], "KLSE Regime turned GREEN", "KLSE macro gate flipped to GREEN — hunt longs")
+alertcondition(not macro_go and macro_go[1], "KLSE Regime left GREEN",  "KLSE macro gate left GREEN — tighten / pause")

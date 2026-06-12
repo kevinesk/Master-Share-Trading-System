@@ -1,0 +1,23 @@
+//@version=5
+indicator("RS Rating vs KLCI", overlay=false)
+
+// Settings
+lookback = input.int(252, "Lookback Days (252=1 year)")
+
+// Fetch KLCI
+klci = request.security("MYX:FBMKLCI", timeframe.period, close)
+
+// RS Calculation
+stock_ret = (close / close[lookback] - 1) * 100
+klci_ret  = (klci  / klci[lookback]  - 1) * 100
+rs        = stock_ret - klci_ret
+
+// Plot
+plot(rs, title="RS vs KLCI (%)", color=rs >= 0 ? color.green : color.red, linewidth=2)
+hline(0, "Market Parity", color=color.gray)
+hline(10, "Strong Outperformance", color=color.green, linestyle=hline.style_dashed)
+hline(-10, "Underperformance", color=color.red, linestyle=hline.style_dashed)
+
+// Background
+bgCol = rs >= 10 ? color.new(color.green, 90) : rs >= 0 ? color.new(color.blue, 90) : color.new(color.red, 92)
+bgcolor(bgCol)

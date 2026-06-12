@@ -1,0 +1,244 @@
+//@version=6
+// ============================================================
+// Minervini VCP + SmartMCDX v9 — Phase 2 Pattern Detection Overlay
+// KLSE / Bursa Malaysia Edition
+//
+// Run this INDICATOR alongside v8 strategy on the same chart.
+// Adds pattern-recognition layers from new Knowledge Base files:
+//
+//  [v9-1]  O'Neil CHEAT ENTRY detection (file 39, 42) — in-base entry
+//  [v9-2]  Ryan TIGHT CLOSURES counter (file 41) — N consecutive 1%-tight bars
+//  [v9-3]  Zanger PATTERN tagger (file 41) — HTF / Bull Flag / Pennant / Cup-Handle / ABCD
+//  [v9-4]  Position Size suggestion at entry (POSITION_SIZE_CALCULATOR.md)
+//  [v9-5]  Anti-FOMO 1% extension hard cap (STICKY_NOTE_Anti_FOMO.md)
+//  [v9-6]  Weinstein Stage 2 confirm (file 44) for entry quality
+// ============================================================
+indicator("Minervini VCP + SmartMCDX v9 — Phase 2 Patterns",
+          overlay=true, max_labels_count=200, max_lines_count=20)
+
+// ============================================================
+// 1. INPUTS
+// ============================================================
+grp_oneil = "O'Neil Cheat Entry"
+oneil_min_base_bars = input.int(15, "Min Base Duration for Cheat",  minval=10, group=grp_oneil,
+  tooltip="Cheat entry triggers inside an established base. Wait for at least this many bars of base.")
+oneil_pullback_pct  = input.float(8.0, "Cheat Trigger: Pullback Min %", step=0.5, group=grp_oneil,
+  tooltip="Cheat fires when stock pulls back at least N% then resumes upward inside base.")
+oneil_resume_bars   = input.int(3, "Bars to confirm cheat resumption", minval=1, maxval=10, group=grp_oneil)
+
+grp_ryan = "Ryan Tight Closures"
+ryan_tight_pct  = input.float(1.0, "Tight close threshold (% from prior close)", step=0.1, group=grp_ryan)
+ryan_min_tight  = input.int(5,    "Min consecutive tight closes",                minval=3,  group=grp_ryan,
+  tooltip="Ryan identified 7+ consecutive 1%-tight closes as a VCP perfection signal.")
+
+grp_zanger = "Zanger Patterns"
+zng_htf_bars     = input.int(10, "HTF (High Tight Flag) max base bars",       minval=5,  group=grp_zanger,
+  tooltip="High Tight Flag = explosive 100%+ move then ≤25% pullback in ≤10 bars.")
+zng_htf_max_pull = input.float(25.0, "HTF max pullback %", step=1.0, group=grp_zanger)
+zng_flag_bars    = input.int(15, "Bull Flag bars", minval=5, group=grp_zanger)
+zng_flag_pull    = input.float(15.0, "Bull Flag max pullback %", step=1.0, group=grp_zanger)
+
+grp_size9 = "Position Sizing"
+portfolio_rm = input.float(30000.0, "Portfolio Value (RM)", minval=1000, step=1000, group=grp_size9)
+max_pos_pct  = input.float(10.0,    "Max Position %",       minval=1, maxval=20, step=1, group=grp_size9)
+tgt_pos_pct  = input.float(7.0,     "Target Position %",    minval=1, maxval=15, step=1, group=grp_size9)
+risk_pct     = input.float(1.0,     "Risk per Trade %",     minval=0.5, maxval=3, step=0.1, group=grp_size9)
+stop_pct     = input.float(5.0,     "Stop Distance %",      minval=1, maxval=15, step=0.5, group=grp_size9)
+
+grp_fomo9 = "Anti-FOMO"
+fomo_extend = input.float(1.0, "FOMO if > N% above breakout", step=0.1, group=grp_fomo9)
+
+grp_disp9 = "Display"
+show_table = input.bool(true, "Show v9 Dashboard", group=grp_disp9)
+show_cheat = input.bool(true, "Plot Cheat Entry markers", group=grp_disp9)
+show_tight = input.bool(true, "Plot Tight Closure count", group=grp_disp9)
+show_zanger_lbl = input.bool(true, "Plot Zanger pattern label", group=grp_disp9)
+
+// ============================================================
+// 2. CORE INDICATORS
+// ============================================================
+ema21  = ta.ema(close, 21)
+ema50  = ta.ema(close, 50)
+ema150 = ta.ema(close, 150)
+ema200 = ta.ema(close, 200)
+ema30W = ta.ema(close, 150)     // ~30-week MA on daily
+volAvg = ta.sma(volume, 50)
+
+// Stage 2 check (Weinstein simplified)
+stage2 = close > ema30W and ema30W > ema30W[20] and close > ema50 and ema50 > ema150
+
+// Base detection — looking back for a flat zone
+base_low  = ta.lowest(low,  oneil_min_base_bars)
+base_high = ta.highest(high, oneil_min_base_bars)
+base_depth = base_high > 0 ? (base_high - base_low) / base_high * 100 : 0
+in_base = base_depth >= 5 and base_depth <= 40  // not too tight, not too wide
+
+// ============================================================
+// 3. O'NEIL CHEAT ENTRY DETECTION
+// ============================================================
+// Cheat fires when:
+// - In an established Stage 2 base
+// - Pulled back oneil_pullback_pct% from recent swing high
+// - Now resuming upward (close > prior close for resume_bars)
+swing_hi = ta.highest(high, 20)
+pullback_done = (swing_hi - low) / swing_hi * 100 >= oneil_pullback_pct
+resuming = ta.rising(close, oneil_resume_bars)
+cheat_entry = stage2 and in_base and pullback_done and resuming and close > ema21
+
+if show_cheat and cheat_entry and not cheat_entry[1]
+    label.new(bar_index, low * 0.99, "🔵 CHEAT",
+              color=color.new(color.blue, 30), textcolor=color.white,
+              style=label.style_label_up, size=size.small)
+
+// ============================================================
+// 4. RYAN TIGHT CLOSURES COUNTER
+// ============================================================
+var int tight_count = 0
+pct_change = math.abs((close - close[1]) / close[1]) * 100
+if pct_change <= ryan_tight_pct
+    tight_count := tight_count + 1
+else
+    tight_count := 0
+
+ryan_signal = tight_count >= ryan_min_tight
+
+if show_tight and ryan_signal and not ryan_signal[1]
+    label.new(bar_index, high * 1.01,
+              "✨ Tight×" + str.tostring(tight_count),
+              color=color.new(color.purple, 30), textcolor=color.white,
+              style=label.style_label_down, size=size.small)
+
+// ============================================================
+// 5. ZANGER PATTERN TAGGER
+// ============================================================
+// High Tight Flag — 100%+ run in last 60 bars, then ≤25% pullback in ≤10 bars
+prior_high_60 = ta.highest(high, 60)
+prior_low_60  = ta.lowest(low, 60)
+run_pct = prior_low_60 > 0 ? (prior_high_60 - prior_low_60) / prior_low_60 * 100 : 0
+recent_pull_pct = prior_high_60 > 0 ? (prior_high_60 - ta.lowest(low, zng_htf_bars)) / prior_high_60 * 100 : 0
+zanger_htf = run_pct >= 100 and recent_pull_pct <= zng_htf_max_pull and recent_pull_pct >= 5
+
+// Bull Flag — uptrend then sideways/down small range
+trend_run = close > ema21 and ema21 > ema50
+flag_pull = prior_high_60 > 0 ? (prior_high_60 - ta.lowest(low, zng_flag_bars)) / prior_high_60 * 100 : 0
+zanger_flag = trend_run and flag_pull <= zng_flag_pull and flag_pull >= 3 and not zanger_htf
+
+// Cup with Handle — simplified: recovery to within 5% of prior high after deep base
+near_old_high = base_high > 0 and (close / base_high) >= 0.95
+cup_handle = stage2 and in_base and near_old_high and base_depth > 15 and base_depth <= 35 and not zanger_htf and not zanger_flag
+
+// Pennant — tight contracting range
+penn_high = ta.highest(high, 10)
+penn_low  = ta.lowest(low, 10)
+penn_high_5 = ta.highest(high, 5)
+penn_low_5  = ta.lowest(low, 5)
+pennant = (penn_high - penn_low) > 0 and (penn_high_5 - penn_low_5) / (penn_high - penn_low) < 0.6 and stage2
+
+// ABCD — pullback then push up (simplified leg-to-leg)
+ab_leg = ta.highest(high, 20) - ta.lowest(low, 20)
+abcd = ab_leg > 0 and (high - low) > 0 and close > open and close > ema21 and pullback_done
+
+zanger_pattern =
+  zanger_htf  ? "HIGH TIGHT FLAG" :
+  zanger_flag ? "BULL FLAG" :
+  cup_handle  ? "CUP w/ HANDLE" :
+  pennant     ? "PENNANT" :
+  abcd        ? "ABCD" :
+  "—"
+
+if show_zanger_lbl and barstate.islast and zanger_pattern != "—"
+    label.new(bar_index, high * 1.03, "Zanger: " + zanger_pattern,
+              color=color.new(color.teal, 20), textcolor=color.white,
+              style=label.style_label_down, size=size.normal)
+
+// ============================================================
+// 6. ANTI-FOMO EXTENSION CHECK
+// ============================================================
+pivot15 = ta.highest(high, 15)[1]
+dist_pivot = pivot15 > 0 ? ((close / pivot15) - 1) * 100 : 0
+fomo = dist_pivot > fomo_extend
+fomo_text =
+  dist_pivot > 3.0 ? "🔴 EXTENDED" :
+  dist_pivot > fomo_extend ? "🟡 LATE" :
+  dist_pivot >= -1.0 ? "🟢 BUY ZONE" :
+  "⏳ <PIVOT"
+
+// ============================================================
+// 7. POSITION SIZE CALCULATOR
+// ============================================================
+max_u    = math.floor((portfolio_rm * max_pos_pct / 100) / close / 100) * 100
+target_u = math.floor((portfolio_rm * tgt_pos_pct / 100) / close / 100) * 100
+risk_rm  = portfolio_rm * risk_pct / 100
+risk_per_sh = close * (stop_pct / 100)
+risk_u   = risk_per_sh > 0 ? math.floor((risk_rm / risk_per_sh) / 100) * 100 : 0
+final_u  = math.min(math.min(max_u, target_u > 0 ? target_u : max_u), risk_u > 0 ? risk_u : max_u)
+final_cost = final_u * close
+final_pct  = portfolio_rm > 0 ? (final_cost / portfolio_rm) * 100 : 0
+
+// ============================================================
+// 8. ENTRY QUALITY COMPOSITE
+// ============================================================
+quality_signals =
+  (stage2 ? 1 : 0) +
+  (cheat_entry ? 1 : 0) +
+  (ryan_signal ? 1 : 0) +
+  (zanger_pattern != "—" ? 1 : 0) +
+  (not fomo ? 1 : 0)
+quality_label =
+  quality_signals >= 4 ? "🟢 A+ SETUP" :
+  quality_signals >= 3 ? "🟡 A SETUP" :
+  quality_signals >= 2 ? "🟠 B SETUP" :
+  "🔴 SKIP"
+
+// ============================================================
+// 9. v9 DASHBOARD
+// ============================================================
+var table v9t = table.new(position.bottom_right, 2, 11,
+                          bgcolor=#0a0e27,
+                          border_color=color.gray, border_width=1)
+
+f_cell9(int r, string lbl, string val, color valcol) =>
+    table.cell(v9t, 0, r, lbl, text_color=color.white,
+               bgcolor=#0a0e27, text_size=size.small,
+               text_halign=text.align_left)
+    table.cell(v9t, 1, r, val, text_color=valcol,
+               bgcolor=#0a0e27, text_size=size.small,
+               text_halign=text.align_right)
+
+if show_table and barstate.islast
+    table.cell(v9t, 0, 0, "v9 PATTERN LAYERS", text_color=color.yellow,
+               bgcolor=#16213e, text_size=size.normal)
+    table.cell(v9t, 1, 0, "──────────", text_color=color.yellow,
+               bgcolor=#16213e, text_size=size.small)
+
+    f_cell9(1, "Weinstein Stage 2", stage2 ? "✓ YES" : "✗ NO",
+            stage2 ? color.lime : color.red)
+    f_cell9(2, "In Established Base", in_base ? "✓ YES" : "✗ NO",
+            in_base ? color.lime : color.gray)
+    f_cell9(3, "Base Depth %", str.tostring(base_depth, "#.#") + "%", color.white)
+    f_cell9(4, "O'Neil Cheat", cheat_entry ? "✓ FIRED" : "—",
+            cheat_entry ? color.aqua : color.gray)
+    f_cell9(5, "Ryan Tight Count", str.tostring(tight_count) + " (need " + str.tostring(ryan_min_tight) + ")",
+            ryan_signal ? color.lime : color.gray)
+    f_cell9(6, "Zanger Pattern", zanger_pattern,
+            zanger_pattern != "—" ? color.teal : color.gray)
+    f_cell9(7, "Dist vs 15b Pivot", str.tostring(dist_pivot, "#.##") + "%",
+            fomo ? color.red : color.lime)
+    f_cell9(8, "FOMO Check", fomo_text,
+            fomo ? color.red : color.lime)
+    f_cell9(9, "Suggested Size", str.tostring(final_u) + " (" + str.tostring(final_pct, "#.#") + "%)",
+            color.white)
+    f_cell9(10, "Setup Quality", quality_label,
+            quality_signals >= 3 ? color.lime : quality_signals >= 2 ? color.orange : color.red)
+
+// ============================================================
+// 10. ALERTS
+// ============================================================
+alertcondition(cheat_entry and not cheat_entry[1],
+               title="v9 O'NEIL CHEAT ENTRY", message="Cheat entry triggered inside Stage 2 base")
+alertcondition(ryan_signal and not ryan_signal[1],
+               title="v9 RYAN TIGHT CLOSURES", message="5+ consecutive 1%-tight closes — VCP perfection")
+alertcondition(zanger_htf and not zanger_htf[1],
+               title="v9 HIGH TIGHT FLAG", message="Zanger HTF detected — explosive setup")
+alertcondition(quality_signals >= 4 and quality_signals[1] < 4,
+               title="v9 A+ SETUP", message="4+ pattern signals aligned — A+ setup")

@@ -1,0 +1,211 @@
+//@version=5
+// ============================================================
+// V9 Watchlist Ranker — Pine Screener for the rest of us
+// Evaluates V9-style gates across 10 KLSE symbols at once.
+// Load on ANY chart (e.g. FBMKLCI). Table updates each bar.
+//
+// Workaround for Essential plan (no Pine Screener access).
+// Each symbol uses 1 request.security() with tuple return = 10 total.
+// ============================================================
+indicator("V9 Watchlist Ranker", overlay=true, max_labels_count=20)
+
+// ============================================================
+// 1. INPUTS — 10 symbol slots
+// ============================================================
+grp_syms = "Watchlist (10 slots)"
+s01 = input.symbol("MYX:5285",  "01",  group=grp_syms)  // VITROX
+s02 = input.symbol("MYX:0166",  "02",  group=grp_syms)  // INARI
+s03 = input.symbol("MYX:1155",  "03",  group=grp_syms)  // MAYBANK
+s04 = input.symbol("MYX:4197",  "04",  group=grp_syms)  // SIME
+s05 = input.symbol("MYX:5183",  "05",  group=grp_syms)  // PCHEM
+s06 = input.symbol("MYX:5225",  "06",  group=grp_syms)  // IHH
+s07 = input.symbol("MYX:5288",  "07",  group=grp_syms)  // SIMEPROP
+s08 = input.symbol("MYX:2445",  "08",  group=grp_syms)  // KLK
+s09 = input.symbol("MYX:4707",  "09",  group=grp_syms)  // NESTLE
+s10 = input.symbol("MYX:5168",  "10",  group=grp_syms)  // HARTALEGA
+
+grp_thr = "V9 Thresholds (match your V9 inputs)"
+min_vol      = input.int(50000, "Min 5-min volume (shares)", minval=1000, step=10000, group=grp_thr)
+surge_x      = input.float(1.5, "Vol surge x avg",            step=0.1, group=grp_thr)
+fomo_pct     = input.float(1.0, "FOMO block % above 5b pivot", step=0.1, group=grp_thr)
+
+grp_ui = "Display"
+show_only_arm = input.bool(false, "Show only ARM+ (≥4 gates)", group=grp_ui)
+tbl_pos = input.string("middle_right", "Table position",
+  options=["top_right","middle_right","bottom_right","bottom_left"], group=grp_ui)
+
+grp_alert = "Alert Confirmation"
+confirm_bars_snipe = input.int(2, "Bars SNIPE must persist before firing", minval=1, maxval=5, group=grp_alert,
+  tooltip="Filters out 1-bar flash signals. 2 = needs 2 consecutive bars at SNIPE.")
+confirm_bars_arm = input.int(1, "Bars ARM must persist before firing", minval=1, maxval=5, group=grp_alert,
+  tooltip="ARM is informational, 1-bar is usually fine.")
+
+// ============================================================
+// 2. KLSE SESSION (shared across all stocks)
+// ============================================================
+hr  = hour(time, "Asia/Kuala_Lumpur")
+mn  = minute(time, "Asia/Kuala_Lumpur")
+mnt = hr * 60 + mn
+
+in_am = mnt >= 540  and mnt < 750
+in_pm = mnt >= 870  and mnt < 1020
+in_open_block  = (mnt >= 540 and mnt < 570) or (mnt >= 870 and mnt < 885)
+in_close_block = (mnt >= 735 and mnt < 750) or (mnt >= 1005 and mnt < 1020)
+in_lunch       = mnt >= 750 and mnt < 870
+session_ok = (in_am or in_pm) and not in_open_block and not in_close_block and not in_lunch
+
+// ============================================================
+// 3. PER-SYMBOL EVALUATOR (tuple = 1 request.security call)
+// ============================================================
+f_eval(string sym) =>
+    [c, v, va, e20, hi5, c1, c2, o0, h0, l0] = request.security(sym, "5", [close, volume, ta.sma(volume, 20), ta.ema(close, 20), ta.highest(high, 5)[1], close[1], close[2], open, high, low], ignore_invalid_symbol=true)
+    // Derived
+    body  = math.abs(c - o0)
+    rng   = h0 - l0
+    up    = c > o0
+    bull_engulf = up and (c1 < c2) and c > o0 and (o0 < c1)
+    hammer      = body > 0 and (math.min(o0, c) - l0) >= body * 2 and (h0 - math.max(o0, c)) <= body * 0.5
+    candle_sig  = bull_engulf or hammer
+    vol_ok      = not na(v)  and v  >= min_vol
+    surge_ok    = not na(v)  and not na(va) and v >= va * surge_x
+    dist_pivot  = not na(hi5) and hi5 > 0 ? (c / hi5 - 1) * 100 : 0
+    fomo_block  = dist_pivot > fomo_pct
+    stage_ok    = not na(e20) and c > e20
+    g1 = session_ok ? 1 : 0
+    g2 = candle_sig ? 1 : 0
+    g3 = (vol_ok and surge_ok) ? 1 : 0
+    g4 = not fomo_block ? 1 : 0
+    g5 = stage_ok ? 1 : 0
+    gates = g1 + g2 + g3 + g4 + g5
+    [c, v, gates, dist_pivot, candle_sig]
+
+[c01, v01, g01, d01, k01] = f_eval(s01)
+[c02, v02, g02, d02, k02] = f_eval(s02)
+[c03, v03, g03, d03, k03] = f_eval(s03)
+[c04, v04, g04, d04, k04] = f_eval(s04)
+[c05, v05, g05, d05, k05] = f_eval(s05)
+[c06, v06, g06, d06, k06] = f_eval(s06)
+[c07, v07, g07, d07, k07] = f_eval(s07)
+[c08, v08, g08, d08, k08] = f_eval(s08)
+[c09, v09, g09, d09, k09] = f_eval(s09)
+[c10, v10, g10, d10, k10] = f_eval(s10)
+
+// ============================================================
+// 4. RENDER TABLE  (sorted by gates desc — manual bubble sort)
+// ============================================================
+f_tier(int g) => g >= 5 ? "🟢 SNIPE" : g == 4 ? "🟠 ARM" : g == 3 ? "🟡 WATCH" : "—"
+f_col(int g)  => g >= 5 ? color.new(color.green, 0) : g == 4 ? color.new(color.orange, 0) : g == 3 ? color.new(#ffd700, 0) : color.new(#1a1a2e, 0)
+f_txt(int g)  => g == 3 ? color.black : color.white
+
+f_sym_short(string s) =>
+    parts = str.split(s, ":")
+    array.size(parts) > 1 ? array.get(parts, 1) : s
+
+// Build arrays for sorting
+syms   = array.from(f_sym_short(s01), f_sym_short(s02), f_sym_short(s03), f_sym_short(s04), f_sym_short(s05), f_sym_short(s06), f_sym_short(s07), f_sym_short(s08), f_sym_short(s09), f_sym_short(s10))
+gates  = array.from(g01, g02, g03, g04, g05, g06, g07, g08, g09, g10)
+prices = array.from(c01, c02, c03, c04, c05, c06, c07, c08, c09, c10)
+dists  = array.from(d01, d02, d03, d04, d05, d06, d07, d08, d09, d10)
+vols   = array.from(v01, v02, v03, v04, v05, v06, v07, v08, v09, v10)
+
+// Sort by gates desc using index array
+order = array.new_int(10)
+for i = 0 to 9
+    array.set(order, i, i)
+for i = 0 to 8
+    for j = 0 to 8 - i
+        a = array.get(order, j)
+        b = array.get(order, j + 1)
+        if array.get(gates, a) < array.get(gates, b)
+            array.set(order, j,     b)
+            array.set(order, j + 1, a)
+
+pos = tbl_pos == "top_right"     ? position.top_right :
+      tbl_pos == "middle_right"  ? position.middle_right :
+      tbl_pos == "bottom_right"  ? position.bottom_right : position.bottom_left
+
+var table tbl = table.new(pos, 5, 12, border_width=1, frame_color=color.gray)
+
+if barstate.islast
+    table.clear(tbl, 0, 0, 4, 11)
+    table.cell(tbl, 0, 0, "Rank",   bgcolor=color.new(color.navy, 0), text_color=color.white, text_size=size.small)
+    table.cell(tbl, 1, 0, "Symbol", bgcolor=color.new(color.navy, 0), text_color=color.white, text_size=size.small)
+    table.cell(tbl, 2, 0, "Tier",   bgcolor=color.new(color.navy, 0), text_color=color.white, text_size=size.small)
+    table.cell(tbl, 3, 0, "Price",  bgcolor=color.new(color.navy, 0), text_color=color.white, text_size=size.small)
+    table.cell(tbl, 4, 0, "vs Piv", bgcolor=color.new(color.navy, 0), text_color=color.white, text_size=size.small)
+
+    row = 1
+    for i = 0 to 9
+        idx = array.get(order, i)
+        g   = array.get(gates, idx)
+        if not show_only_arm or g >= 4
+            sym = array.get(syms,   idx)
+            px  = array.get(prices, idx)
+            dp  = array.get(dists,  idx)
+            tcol  = f_col(g)
+            txcol = f_txt(g)
+            table.cell(tbl, 0, row, str.tostring(row),          bgcolor=tcol, text_color=txcol, text_size=size.small)
+            table.cell(tbl, 1, row, sym,                        bgcolor=tcol, text_color=txcol, text_size=size.small)
+            table.cell(tbl, 2, row, f_tier(g) + "  " + str.tostring(g) + "/5", bgcolor=tcol, text_color=txcol, text_size=size.small)
+            table.cell(tbl, 3, row, na(px) ? "n/a" : str.tostring(px, "#.###"), bgcolor=tcol, text_color=txcol, text_size=size.small)
+            table.cell(tbl, 4, row, na(dp) ? "n/a" : str.tostring(dp, "+#.##;-#.##") + "%", bgcolor=tcol, text_color=txcol, text_size=size.small)
+            row += 1
+    if row == 1
+        table.cell(tbl, 0, 1, "No setups ≥ ARM right now", bgcolor=color.new(color.gray, 70), text_color=color.white, text_size=size.small)
+
+// ============================================================
+// 5. ALERTS — name the actual stock(s) that fired
+// ============================================================
+// Confirmation logic: gate count must be at/above tier for N consecutive bars,
+// AND the Nth bar must be a fresh entry (prevent repeat firing).
+f_persisted(int g, int g1, int g2, int g3, int g4, int tier, int nbars) =>
+    cur  = g  >= tier
+    b1   = nbars >= 2 ? g1 >= tier : true
+    b2   = nbars >= 3 ? g2 >= tier : true
+    b3   = nbars >= 4 ? g3 >= tier : true
+    b4   = nbars >= 5 ? g4 >= tier : true
+    // Fresh: the bar BEFORE the window must have been below tier (entry edge)
+    entry_prev = nbars == 1 ? g1 < tier :
+                 nbars == 2 ? g2 < tier :
+                 nbars == 3 ? g3 < tier :
+                 nbars == 4 ? g4 < tier : true
+    cur and b1 and b2 and b3 and b4 and entry_prev
+
+f_arm_fire(int g)   => f_persisted(g, g[1], g[2], g[3], g[4], 4, confirm_bars_arm)
+f_snipe_fire(int g) => f_persisted(g, g[1], g[2], g[3], g[4], 5, confirm_bars_snipe)
+
+// Build comma-separated string of stocks firing SNIPE this bar (after persistence check)
+snipe_list = ""
+snipe_list := f_snipe_fire(g01) ? snipe_list + array.get(syms, 0) + " " : snipe_list
+snipe_list := f_snipe_fire(g02) ? snipe_list + array.get(syms, 1) + " " : snipe_list
+snipe_list := f_snipe_fire(g03) ? snipe_list + array.get(syms, 2) + " " : snipe_list
+snipe_list := f_snipe_fire(g04) ? snipe_list + array.get(syms, 3) + " " : snipe_list
+snipe_list := f_snipe_fire(g05) ? snipe_list + array.get(syms, 4) + " " : snipe_list
+snipe_list := f_snipe_fire(g06) ? snipe_list + array.get(syms, 5) + " " : snipe_list
+snipe_list := f_snipe_fire(g07) ? snipe_list + array.get(syms, 6) + " " : snipe_list
+snipe_list := f_snipe_fire(g08) ? snipe_list + array.get(syms, 7) + " " : snipe_list
+snipe_list := f_snipe_fire(g09) ? snipe_list + array.get(syms, 8) + " " : snipe_list
+snipe_list := f_snipe_fire(g10) ? snipe_list + array.get(syms, 9) + " " : snipe_list
+
+arm_list = ""
+arm_list := f_arm_fire(g01) ? arm_list + array.get(syms, 0) + " " : arm_list
+arm_list := f_arm_fire(g02) ? arm_list + array.get(syms, 1) + " " : arm_list
+arm_list := f_arm_fire(g03) ? arm_list + array.get(syms, 2) + " " : arm_list
+arm_list := f_arm_fire(g04) ? arm_list + array.get(syms, 3) + " " : arm_list
+arm_list := f_arm_fire(g05) ? arm_list + array.get(syms, 4) + " " : arm_list
+arm_list := f_arm_fire(g06) ? arm_list + array.get(syms, 5) + " " : arm_list
+arm_list := f_arm_fire(g07) ? arm_list + array.get(syms, 6) + " " : arm_list
+arm_list := f_arm_fire(g08) ? arm_list + array.get(syms, 7) + " " : arm_list
+arm_list := f_arm_fire(g09) ? arm_list + array.get(syms, 8) + " " : arm_list
+arm_list := f_arm_fire(g10) ? arm_list + array.get(syms, 9) + " " : arm_list
+
+if str.length(snipe_list) > 0
+    alert("🟢 SNIPE: " + snipe_list + "— open chart now", alert.freq_once_per_bar)
+
+if str.length(arm_list) > 0
+    alert("🟠 ARM: " + arm_list + "— check ranker", alert.freq_once_per_bar)
+
+alertcondition(str.length(snipe_list) > 0,
+  title="Ranker SNIPE", message="🟢 SNIPE fired on watchlist — open ranker table")
+alertcondition(str.length(arm_list) > 0,
+  title="Ranker ARM",   message="🟠 ARM fired on watchlist — open ranker table")

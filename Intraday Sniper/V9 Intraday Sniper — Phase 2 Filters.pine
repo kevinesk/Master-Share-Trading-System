@@ -1,0 +1,353 @@
+//@version=5
+// ============================================================
+// V9 Intraday Sniper — Phase 2 Filter Overlay
+// KLSE / Bursa Malaysia 5-minute timeframe
+//
+// Run alongside V8 Intraday Sniper. Adds:
+//  [v9-1]  Fred Tam candlestick filter (file 52) — Engulfing, Morning Star,
+//          Three White Soldiers, Piercing, Hammer-doji
+//  [v9-2]  Pauline Yong session-timing filter (file 51) — block trades in
+//          opening 30 min, lunch break, closing-15min auction
+//  [v9-3]  KLSE intraday volume thresholds (file 52) — sector-aware minimums
+//  [v9-4]  Position-size calculator for intraday (portfolio-aware)
+//  [v9-5]  Anti-FOMO chase guard — block buy if >1% above 5-bar pivot
+//  [v9-6]  Master Decision Tree 6-gate intraday summary
+// ============================================================
+indicator("V9 Intraday Sniper — Phase 2 Filters",
+          overlay=true, max_labels_count=100, max_lines_count=5)
+
+// ============================================================
+// 1. INPUTS
+// ============================================================
+grp_sess = "Bursa Session Filter (MYT)"
+block_open_min   = input.int(30, "Block first N min of session",    minval=0, maxval=60, group=grp_sess,
+  tooltip="Pauline Yong: First 30 min is auction-driven chaos. Avoid trading.")
+block_close_min  = input.int(15, "Block last N min of session",     minval=0, maxval=30, group=grp_sess,
+  tooltip="Closing auction window — institutional rebalance, retail chase. Skip.")
+block_lunch_dip  = input.bool(true, "Block 15 min after lunch reopen", group=grp_sess,
+  tooltip="14:30-14:45 chop — let the session settle.")
+
+grp_candle = "Fred Tam Candlestick Filters"
+use_engulf  = input.bool(true, "Bullish Engulfing",         group=grp_candle)
+use_morning = input.bool(true, "Morning Star (3-bar)",      group=grp_candle)
+use_3wsold  = input.bool(true, "Three White Soldiers",      group=grp_candle)
+use_pierce  = input.bool(true, "Piercing Pattern",          group=grp_candle)
+use_hamdoji = input.bool(true, "Hammer / Doji at support",  group=grp_candle)
+
+grp_vol9 = "KLSE Intraday Volume (Fred Tam thresholds)"
+min_5min_vol = input.int(50000, "Min 5-min volume (shares)", minval=1000, step=10000, group=grp_vol9,
+  tooltip="Fred Tam: KLSE Stage 2 stocks need at least 50K per 5-min bar for clean execution.")
+vol_surge_x  = input.float(1.5, "Surge vs 20-bar avg",       step=0.1, group=grp_vol9)
+
+grp_size9i = "Position Sizing (Intraday)"
+portfolio_rm  = input.float(30000.0, "Portfolio Value (RM)", minval=1000, step=1000, group=grp_size9i)
+intra_max_pct = input.float(5.0,     "Max Intraday Pos %",   minval=1, maxval=15, step=1, group=grp_size9i,
+  tooltip="Intraday positions sized smaller than swing (default 5% vs swing's 10%).")
+intra_risk_pct = input.float(0.5,    "Risk per Intraday Trade %", minval=0.1, maxval=2, step=0.1, group=grp_size9i)
+intra_stop_pct = input.float(2.0,    "Assumed Intraday Stop %",   minval=0.5, maxval=5, step=0.1, group=grp_size9i)
+
+grp_fomo9i = "Anti-FOMO Chase Guard"
+fomo_extend = input.float(1.0, "Block buy if > N% above 5-bar pivot", step=0.1, group=grp_fomo9i)
+
+grp_cost = "Broker Costs (Moomoo MY defaults)"
+comm_pct      = input.float(0.038, "Commission % per side",        step=0.005, group=grp_cost)
+comm_min_rm   = input.float(7.0,   "Min commission per trade (RM)", minval=0, step=0.5, group=grp_cost)
+clearing_pct  = input.float(0.030, "Clearing fee %",                step=0.005, group=grp_cost)
+sc_fee_pct    = input.float(0.0075,"SC fee %",                      step=0.001, group=grp_cost)
+stamp_pct     = input.float(0.150, "Stamp duty % (sell only, cap RM 1000)", step=0.01, group=grp_cost)
+assumed_gross = input.float(2.0,   "Assumed gross move % for viability check", step=0.1, group=grp_cost,
+  tooltip="Trade must produce positive NET profit at this gross move size. Default 2% = typical V8 TP1.")
+min_net_pct   = input.float(1.0,   "Min net profit % after costs to allow trade", step=0.1, group=grp_cost,
+  tooltip="Block trade if net profit < this %. Default 1% — covers slippage + R:R minimum.")
+
+grp_disp9i = "Display"
+show_table9 = input.bool(true, "Show v9 Dashboard", group=grp_disp9i)
+show_session_lbl = input.bool(true, "Plot session-block labels", group=grp_disp9i)
+
+// ============================================================
+// 2. BURSA SESSION TIMING (MYT)
+// ============================================================
+// Bursa: 09:00-12:30 morning, 14:30-17:00 afternoon (MYT)
+hr  = hour(time, "Asia/Kuala_Lumpur")
+mn  = minute(time, "Asia/Kuala_Lumpur")
+mnt = hr * 60 + mn   // minutes since midnight
+
+// Sessions
+am_open  = 9*60       // 540
+am_close = 12*60 + 30 // 750
+pm_open  = 14*60 + 30 // 870
+pm_close = 17*60      // 1020
+
+in_am = mnt >= am_open and mnt < am_close
+in_pm = mnt >= pm_open and mnt < pm_close
+in_session = in_am or in_pm
+
+// Block windows
+in_open_block  = (mnt >= am_open and mnt < am_open + block_open_min) or
+                 (mnt >= pm_open and mnt < pm_open + (block_lunch_dip ? 15 : 0))
+in_close_block = (mnt >= am_close - block_close_min and mnt < am_close) or
+                 (mnt >= pm_close - block_close_min and mnt < pm_close)
+in_lunch       = mnt >= am_close and mnt < pm_open
+
+session_ok = in_session and not in_open_block and not in_close_block and not in_lunch
+
+session_status =
+  in_lunch          ? "🍴 LUNCH — closed" :
+  in_open_block     ? "⏸ OPEN BLOCK — wait" :
+  in_close_block    ? "⏸ CLOSE BLOCK — wait" :
+  in_am             ? "🟢 AM session" :
+  in_pm             ? "🟢 PM session" :
+  "🔴 OUT OF HOURS"
+
+if show_session_lbl and (in_open_block and not in_open_block[1])
+    label.new(bar_index, high * 1.02, "⏸ OPEN BLOCK",
+              color=color.new(color.orange, 30), textcolor=color.white,
+              style=label.style_label_down, size=size.small)
+if show_session_lbl and (in_close_block and not in_close_block[1])
+    label.new(bar_index, high * 1.02, "⏸ CLOSE BLOCK",
+              color=color.new(color.orange, 30), textcolor=color.white,
+              style=label.style_label_down, size=size.small)
+
+// ============================================================
+// 3. FRED TAM CANDLESTICK PATTERNS
+// ============================================================
+body  = math.abs(close - open)
+rng   = high - low
+up    = close > open
+dn    = close < open
+
+// Bullish Engulfing
+bull_engulf = use_engulf and up and dn[1] and close > open[1] and open < close[1] and body > body[1]
+
+// Morning Star (3-bar)
+morning_star = use_morning and
+               dn[2] and body[2] > 0 and                                // bar -2 = bearish body
+               body[1] < body[2] * 0.5 and                              // bar -1 = small body
+               up and close > (open[2] + close[2]) / 2                  // bar 0 = bullish closing above bar-2 midpoint
+
+// Three White Soldiers
+three_white = use_3wsold and up and up[1] and up[2] and
+              close > close[1] and close[1] > close[2] and
+              open > open[1] and open[1] > open[2] and
+              body > rng * 0.5
+
+// Piercing Pattern
+piercing = use_pierce and dn[1] and up and open < close[1] and
+           close > (open[1] + close[1]) / 2 and close < open[1]
+
+// Hammer (lower wick ≥ 2x body, small upper wick, near recent low)
+lower_wick = math.min(open, close) - low
+upper_wick = high - math.max(open, close)
+near_low = low <= ta.lowest(low, 10)[0]   // current bar's low at/near 10-bar low
+hammer = use_hamdoji and body > 0 and lower_wick >= body * 2 and
+         upper_wick <= body * 0.5 and near_low
+
+// Doji at support
+doji = use_hamdoji and body <= rng * 0.1 and rng > 0 and near_low
+
+candle_signal = bull_engulf or morning_star or three_white or piercing or hammer or doji
+
+candle_name =
+  three_white  ? "3 White Soldiers" :
+  morning_star ? "Morning Star" :
+  bull_engulf  ? "Bull Engulfing" :
+  piercing     ? "Piercing" :
+  hammer       ? "Hammer" :
+  doji         ? "Doji@Sup" :
+  "—"
+
+// ============================================================
+// 4. KLSE VOLUME THRESHOLD CHECK
+// ============================================================
+volAvg = ta.sma(volume, 20)
+vol_min_ok = volume >= min_5min_vol
+vol_surge_ok = volume >= volAvg * vol_surge_x
+vol_quality = vol_min_ok and vol_surge_ok
+
+// ============================================================
+// 5. ANTI-FOMO CHASE GUARD
+// ============================================================
+pivot5 = ta.highest(high, 5)[1]
+dist_pivot = pivot5 > 0 ? ((close / pivot5) - 1) * 100 : 0
+fomo_block = dist_pivot > fomo_extend
+
+// ============================================================
+// 6. POSITION SIZING
+// ============================================================
+max_u    = math.floor((portfolio_rm * intra_max_pct / 100) / close / 100) * 100
+risk_rm  = portfolio_rm * intra_risk_pct / 100
+risk_per_sh = close * (intra_stop_pct / 100)
+risk_u   = risk_per_sh > 0 ? math.floor((risk_rm / risk_per_sh) / 100) * 100 : 0
+final_u  = math.min(max_u, risk_u > 0 ? risk_u : max_u)
+final_cost = final_u * close
+final_pct  = portfolio_rm > 0 ? (final_cost / portfolio_rm) * 100 : 0
+
+// ============================================================
+// 6b. COST-AWARE VIABILITY CHECK
+// ============================================================
+// Round-trip cost = buy commission + sell commission + clearing×2 + sc×2 + stamp×1
+f_trade_cost(float value) =>
+    comm = math.max(value * comm_pct / 100, comm_min_rm)
+    clr  = value * clearing_pct / 100
+    sc   = value * sc_fee_pct / 100
+    comm + clr + sc
+
+stamp_on_sell = math.min(final_cost * (1 + assumed_gross/100) * stamp_pct / 100, 1000.0)
+rt_cost = f_trade_cost(final_cost) + f_trade_cost(final_cost * (1 + assumed_gross/100)) + stamp_on_sell
+gross_profit_rm = final_cost * assumed_gross / 100
+net_profit_rm   = gross_profit_rm - rt_cost
+net_pct_actual  = final_cost > 0 ? (net_profit_rm / final_cost) * 100 : 0
+cost_ratio      = gross_profit_rm > 0 ? (rt_cost / gross_profit_rm) * 100 : 999
+trade_viable    = net_pct_actual >= min_net_pct
+
+// Minimum viable position value to clear the cost hurdle
+// At pure % fees: net% = gross% × (1 - 2×comm_pct/100 - 2×clearing_pct/100 - 2×sc_pct/100 - stamp_pct/100)
+// Pure % structure ignores minimums; minimums dominate small trades.
+// Approx min position for min_net_pct net at assumed_gross gross:
+//   ignoring stamp/clearing for simplicity, need value × gross% - 2×comm_min ≥ value × min_net%
+//   → value ≥ 2×comm_min / (gross% - min_net%) × 100
+min_viable_rm = (assumed_gross - min_net_pct) > 0 ? (2 * comm_min_rm) / (assumed_gross - min_net_pct) * 100 : 0
+
+// ============================================================
+// 7. MASTER DECISION TREE QUICK GATES (intraday version)
+// ============================================================
+gate1_session = session_ok
+gate2_candle  = candle_signal
+gate3_volume  = vol_quality
+gate4_fomo    = not fomo_block
+gate5_size    = final_u >= 100
+gate6_stage   = close > ta.ema(close, 20)   // basic up-trend confirm
+gate7_cost    = trade_viable                // NEW: net-profit-after-costs gate
+
+gates = (gate1_session ? 1 : 0) + (gate2_candle ? 1 : 0) + (gate3_volume ? 1 : 0) + (gate4_fomo ? 1 : 0) + (gate5_size ? 1 : 0) + (gate6_stage ? 1 : 0) + (gate7_cost ? 1 : 0)
+
+verdict =
+  gates == 7 ? "🟢 ALL 7/7 — SNIPE" :
+  gates >= 6 ? "🟡 6/7 — Review" :
+  not trade_viable ? "💸 SKIP — COSTS EAT PROFIT" :
+  gates >= 4 ? "🟠 " + str.tostring(gates) + "/7 — Marginal" :
+  "🔴 " + str.tostring(gates) + "/7 — SKIP"
+
+// ============================================================
+// 8. V9 DASHBOARD
+// ============================================================
+var table v9it = table.new(position.bottom_left, 2, 13,
+                           bgcolor=#0a0e27,
+                           border_color=color.gray, border_width=1)
+
+f_cell9i(int r, string lbl, string val, color valcol) =>
+    table.cell(v9it, 0, r, lbl, text_color=color.white,
+               bgcolor=#0a0e27, text_size=size.small,
+               text_halign=text.align_left)
+    table.cell(v9it, 1, r, val, text_color=valcol,
+               bgcolor=#0a0e27, text_size=size.small,
+               text_halign=text.align_right)
+
+if show_table9 and barstate.islast
+    table.cell(v9it, 0, 0, "v9 INTRADAY FILTERS", text_color=color.yellow,
+               bgcolor=#16213e, text_size=size.normal)
+    table.cell(v9it, 1, 0, "──────────", text_color=color.yellow,
+               bgcolor=#16213e, text_size=size.small)
+    f_cell9i(1, "Session", session_status, session_ok ? color.lime : color.red)
+    f_cell9i(2, "Fred Tam Candle", candle_name, candle_signal ? color.lime : color.gray)
+    f_cell9i(3, "5-min Vol", str.tostring(volume / 1000, "#.#") + "K (min " + str.tostring(min_5min_vol/1000) + "K)",
+             vol_min_ok ? color.lime : color.red)
+    f_cell9i(4, "Vol Surge", str.tostring(volume / volAvg, "#.#") + "x",
+             vol_surge_ok ? color.lime : color.gray)
+    f_cell9i(5, "Dist vs 5b Pivot", str.tostring(dist_pivot, "#.##") + "%",
+             fomo_block ? color.red : color.lime)
+    f_cell9i(6, "Suggested Size", str.tostring(final_u) + " (" + str.tostring(final_pct, "#.#") + "%)",
+             color.white)
+    f_cell9i(7, "Position Cost", "RM " + str.tostring(final_cost, "#"), color.white)
+    f_cell9i(8, "Round-Trip Cost", "RM " + str.tostring(rt_cost, "#.#") + " (" + str.tostring(cost_ratio, "#") + "% of gross)",
+             cost_ratio > 50 ? color.red : cost_ratio > 25 ? color.orange : color.lime)
+    f_cell9i(9, "Net @ " + str.tostring(assumed_gross, "#.#") + "% move", "RM " + str.tostring(net_profit_rm, "#.#") + " (" + str.tostring(net_pct_actual, "+#.##;-#.##") + "%)",
+             trade_viable ? color.lime : color.red)
+    f_cell9i(10, "Min Viable Position", "RM " + str.tostring(min_viable_rm, "#"),
+             final_cost >= min_viable_rm ? color.lime : color.red)
+    f_cell9i(11, "Gates Passed", str.tostring(gates) + "/7",
+             gates >= 6 ? color.lime : gates >= 4 ? color.orange : color.red)
+    f_cell9i(12, "Verdict", verdict,
+             gates >= 6 ? color.lime : not trade_viable ? color.red : gates >= 4 ? color.orange : color.red)
+
+// ============================================================
+// 9. CANDLE LABEL ON CHART
+// ============================================================
+if candle_signal and not candle_signal[1] and session_ok
+    label.new(bar_index, low * 0.998, "▲ " + candle_name,
+              color=color.new(color.green, 20), textcolor=color.white,
+              style=label.style_label_up, size=size.small)
+
+// ============================================================
+// 10. PRE-ARM EARLY WARNING TIERS  (intra-bar, fire FAST)
+// ============================================================
+// Goal: give 5-15 min lead time before the 6/6 SNIPE prints.
+// WATCH = setup forming. ARM = trigger imminent. SNIPE = execute.
+
+// Early indicators (don't wait for full gate to pass)
+vol_building   = volume >= volAvg * 1.2                    // approaching surge (1.2x of 1.5x target)
+near_pivot     = pivot5 > 0 and math.abs(close / pivot5 - 1) * 100 <= 0.3   // within 0.3% of 5b pivot
+above_ema20    = close > ta.ema(close, 20)
+rsi_rising     = ta.rsi(close, 14) > ta.rsi(close, 14)[1] and ta.rsi(close, 14) > 50
+momentum_up    = close > close[1] and close[1] > close[2]  // 2 consecutive higher closes
+
+// Tier conditions (now requires cost-viability to escalate to ARM/SNIPE)
+watch_cond = session_ok and gates >= 3 and (vol_building or near_pivot or candle_signal)
+arm_cond   = session_ok and gates >= 5 and vol_building and above_ema20 and not fomo_block and trade_viable
+snipe_cond = gates == 7
+
+// Edge-triggered (rising edge only — don't spam)
+watch_fire = watch_cond and not watch_cond[1]
+arm_fire   = arm_cond   and not arm_cond[1]
+snipe_fire = snipe_cond and not snipe_cond[1]
+
+// Visual labels on chart
+if watch_fire
+    label.new(bar_index, high * 1.003, "🟡 WATCH " + str.tostring(gates) + "/7",
+              color=color.new(color.yellow, 20), textcolor=color.black,
+              style=label.style_label_down, size=size.small)
+if arm_fire
+    label.new(bar_index, high * 1.005, "🟠 ARM " + str.tostring(gates) + "/7",
+              color=color.new(color.orange, 10), textcolor=color.white,
+              style=label.style_label_down, size=size.small)
+if snipe_fire
+    label.new(bar_index, high * 1.008, "🟢 SNIPE 7/7",
+              color=color.new(color.green, 0), textcolor=color.white,
+              style=label.style_label_down, size=size.normal)
+
+// ============================================================
+// 11. ALERTS  (alert.freq_all = fires every tick, not bar close)
+// ============================================================
+// IMPORTANT: when creating these in TradingView, choose:
+//   Condition: "Any alert() function call"
+//   Trigger:   "Once Per Bar"  (not "Once Per Bar Close")
+
+if watch_fire
+    alert("🟡 WATCH | " + syminfo.ticker + " | " + str.tostring(gates) +
+          "/6 gates | px=" + str.tostring(close) +
+          " | vol=" + str.tostring(volume/1000, "#.#") + "K" +
+          " | candle=" + candle_name, alert.freq_all)
+
+if arm_fire
+    alert("🟠 ARM | " + syminfo.ticker + " | " + str.tostring(gates) +
+          "/6 gates | px=" + str.tostring(close) +
+          " | vol=" + str.tostring(volume/volAvg, "#.#") + "x avg" +
+          " | dist pivot=" + str.tostring(dist_pivot, "#.##") + "%", alert.freq_all)
+
+if snipe_fire
+    alert("🟢 SNIPE | " + syminfo.ticker + " | 6/6 GATES GREEN" +
+          " | px=" + str.tostring(close) +
+          " | size=" + str.tostring(final_u) + " sh" +
+          " | cost=RM" + str.tostring(final_cost, "#"), alert.freq_all)
+
+// Legacy alertcondition() — keep for backward compatibility with existing alerts
+alertcondition(snipe_fire,
+               title="v9 ALL 6 GATES GREEN", message="6/6 intraday gates green — SNIPE")
+alertcondition(arm_fire,
+               title="v9 ARM (4-5/6)", message="Setup imminent — 4+ gates green, volume building")
+alertcondition(watch_fire,
+               title="v9 WATCH (3/6)", message="Setup forming — open chart, prepare")
+alertcondition(candle_signal and not candle_signal[1] and session_ok,
+               title="v9 CANDLE SIGNAL", message="Fred Tam candle pattern detected in session")
+alertcondition(fomo_block and not fomo_block[1],
+               title="v9 FOMO CHASE GUARD", message="Price extended >1% past 5-bar pivot — DO NOT BUY")

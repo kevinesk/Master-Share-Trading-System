@@ -1,0 +1,27 @@
+//@version=5
+indicator("VCP Volume Contraction", overlay=false)
+
+// Settings
+atr_len = input.int(10, "ATR Length")
+vol_len = input.int(20, "Volume MA Length")
+
+atr     = ta.atr(atr_len)
+vol_avg = ta.sma(volume, vol_len)
+vol_ratio = volume / vol_avg
+
+// Volume contraction: current volume significantly below average
+is_contracting = vol_ratio < 0.6
+
+// ATR contraction: price range narrowing
+atr_avg = ta.sma(atr, 10)
+is_tight = atr < atr_avg * 0.7
+
+// Both contracting = VCP candidate
+vcp_signal = is_contracting and is_tight
+
+// Plot
+plot(vol_ratio, title="Vol Ratio", color=is_contracting ? color.green : color.gray, linewidth=2)
+hline(1.0, "Average", color=color.gray, linestyle=hline.style_dashed)
+hline(0.6, "Contraction Zone", color=color.green, linestyle=hline.style_dashed)
+
+bgcolor(vcp_signal ? color.new(color.green, 85) : na, title="VCP Zone")

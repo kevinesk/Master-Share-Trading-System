@@ -1,0 +1,437 @@
+//@version=5
+// ============================================================
+// V10 Swing Sniper — KLSE Daily Timeframe
+// Designed for 3–10 day holds at larger position sizes
+// Solves the friction trap that breaks V8/V9 intraday at small accounts
+//
+// USE ON: DAILY chart. Not for 5m/15m timeframes.
+// PHILOSOPHY: Fewer trades, larger size, bigger moves, friction-tolerant.
+// ============================================================
+indicator("V10 Swing Sniper (KLSE)", overlay=true,
+          max_labels_count=100, max_lines_count=20)
+
+// ============================================================
+// 1. INPUTS
+// ============================================================
+grp_setup = "Setup Requirements (Minervini Stage 2)"
+require_above_ema200 = input.bool(true,  "Price > EMA200 (Stage 2)", group=grp_setup)
+require_50_above_200 = input.bool(true,  "EMA50 > EMA200",            group=grp_setup)
+require_price_above_50 = input.bool(true,"Price > EMA50",             group=grp_setup)
+within_52w_high_pct  = input.float(25.0, "Max % below 52w high",       step=1, group=grp_setup,
+  tooltip="Minervini rule: ≤25% off 52w high. Closer to high = stronger leader.")
+above_52w_low_pct    = input.float(30.0, "Min % above 52w low",        step=1, group=grp_setup,
+  tooltip="Must be at least N% above 52w low — filters out dead names.")
+
+grp_rs = "Relative Strength (vs KLCI)"
+benchmark_sym = input.symbol("FTSEMYX:FBMKLCI", "Benchmark", group=grp_rs)
+rs_lookback   = input.int(63, "RS lookback (days)", minval=20, maxval=252, group=grp_rs,
+  tooltip="63 days = 3 months. Stock must outperform KLCI over this window.")
+min_rs_pct    = input.float(0.0, "Min RS outperformance %", step=0.5, group=grp_rs)
+
+grp_vcp = "VCP / Pullback Quality"
+contraction_bars = input.int(20, "Contraction lookback (bars)", minval=10, maxval=60, group=grp_vcp)
+max_pullback_pct = input.float(15.0, "Max pullback from recent high %", step=1, group=grp_vcp,
+  tooltip="Healthy pullback. Beyond this = broken structure.")
+vol_dryup_pct    = input.float(80.0, "Vol on pullback ≤ N% of avg", step=5, group=grp_vcp,
+  tooltip="VCP signature: volume contracts on pullback. <80% of 50-day avg.")
+
+grp_entry = "Entry Trigger"
+entry_pivot_lookback = input.int(10, "Pivot resistance lookback", minval=5, maxval=30, group=grp_entry)
+breakout_vol_x       = input.float(1.5, "Breakout volume × avg", step=0.1, group=grp_entry)
+
+grp_coil = "VCP Coil Tightness (calibrate to match V8)"
+coil_mode = input.string("Match V8 (lenient)", "Detection mode",
+  options=["Match V8 (lenient)", "Strict (high quality)", "Custom"], group=grp_coil,
+  tooltip="Lenient catches more setups (matches V8). Strict catches fewer but cleaner.")
+atr_ratio_thr = input.float(0.85, "Custom: ATR(5) < ATR(30) × ?", minval=0.50, maxval=1.0, step=0.05, group=grp_coil,
+  tooltip="Only used in Custom mode. Lower = stricter (more compression required).")
+vol_ratio_thr = input.float(0.90, "Custom: AvgVol(5) < AvgVol(30) × ?", minval=0.50, maxval=1.0, step=0.05, group=grp_coil)
+coil_pullback_thr = input.float(-10.0, "Custom: max pullback %", maxval=0, step=1, group=grp_coil)
+
+grp_size = "Position Sizing (Swing)"
+portfolio_rm   = input.float(30000.0, "Portfolio Value (RM)", minval=1000, step=1000, group=grp_size)
+swing_max_pct  = input.float(15.0, "Max swing position %",    minval=5, maxval=25, step=1, group=grp_size,
+  tooltip="Swing positions sized 3x intraday (15% vs 5%). Friction-tolerant.")
+risk_per_trade = input.float(1.0,  "Risk per trade %",          minval=0.25, maxval=3, step=0.25, group=grp_size)
+stop_pct       = input.float(7.0,  "Initial stop %",             minval=3, maxval=15, step=0.5, group=grp_size,
+  tooltip="Swing stops are wider than intraday — 7-10% typical. Allows for daily noise.")
+
+grp_targets = "Profit Targets"
+tp1_r  = input.float(2.0, "TP1 (R multiple)", step=0.5, group=grp_targets,
+  tooltip="First scale-out at 2R = 2x risk amount in reward.")
+tp2_r  = input.float(4.0, "TP2 (R multiple)", step=0.5, group=grp_targets)
+trail_ema = input.int(20, "Trail stop EMA", group=grp_targets)
+
+grp_cost = "Broker Costs (Moomoo MY defaults)"
+comm_pct      = input.float(0.038, "Commission % per side",        step=0.005, group=grp_cost)
+comm_min_rm   = input.float(7.0,   "Min commission per trade (RM)", minval=0, step=0.5, group=grp_cost)
+clearing_pct  = input.float(0.030, "Clearing fee %",                step=0.005, group=grp_cost)
+sc_fee_pct    = input.float(0.0075,"SC fee %",                      step=0.001, group=grp_cost)
+stamp_pct     = input.float(0.150, "Stamp duty % (sell only)",      step=0.01, group=grp_cost)
+min_net_rr    = input.float(2.0,   "Min NET R:R after costs",       step=0.25, group=grp_cost,
+  tooltip="Reject trade if net reward:risk (after costs) < this value.")
+
+grp_macro = "Macro Filter (optional)"
+require_klci_bull = input.bool(true, "Require KLCI > EMA50", group=grp_macro,
+  tooltip="Per regime dashboard — only hunt in green or amber markets.")
+
+grp_comm = "Commodity / Industry Driver (intermarket check)"
+industry = input.string("None", "Stock industry / sector",
+  options=["None", "Oil & Gas", "Plantation (CPO)", "Semiconductor", "Metals (Copper)", "Gold / Precious", "Steel / Iron Ore", "USD/MYR exporter", "Banking (10Y yield)", "REIT (10Y yield inverse)", "Custom"], group=grp_comm,
+  tooltip="Auto-selects the relevant commodity/index for intermarket check. KLSE stock breakouts have ~40% lower success rate when upstream driver is unsupportive.")
+custom_comm_sym = input.symbol("NYMEX:CL1!", "Custom benchmark (used if 'Custom' selected)", group=grp_comm)
+custom_inverse = input.bool(false, "Custom: inverse relationship (bullish when BELOW EMA50)", group=grp_comm,
+  tooltip="Use for assets where falling = good for stock (e.g. REITs vs yields, exporters vs MYR).")
+require_comm_gate = input.bool(false, "Require driver supportive to EXECUTE", group=grp_comm,
+  tooltip="If true, EXECUTE NOW will not fire unless the upstream driver is supportive. Default off — shown as informational only.")
+
+grp_disp = "Display"
+show_table  = input.bool(true, "Show dashboard",      group=grp_disp)
+show_levels = input.bool(true, "Plot entry/stop/TP lines", group=grp_disp)
+
+// ============================================================
+// 2. INDICATORS
+// ============================================================
+ema20  = ta.ema(close, 20)
+ema50  = ta.ema(close, 50)
+ema200 = ta.ema(close, 200)
+volAvg50 = ta.sma(volume, 50)
+
+hh52 = ta.highest(high, 252)
+ll52 = ta.lowest(low, 252)
+pct_from_52h = (close / hh52 - 1) * 100
+pct_from_52l = (close / ll52 - 1) * 100
+
+// Recent high (for pullback measurement)
+recent_high = ta.highest(high, contraction_bars)
+pullback_pct = (close / recent_high - 1) * 100   // negative when below recent high
+
+// Pivot resistance (entry trigger zone)
+pivot_resist = ta.highest(high, entry_pivot_lookback)[1]
+breakout = close > pivot_resist and volume > volAvg50 * breakout_vol_x
+
+// Pullback volume dry-up
+pullback_active = pullback_pct < -2  // at least 2% off recent high
+recent_avg_vol = ta.sma(volume, 5)
+vol_dryup = pullback_active and recent_avg_vol < volAvg50 * (vol_dryup_pct / 100)
+
+// ============================================================
+// 3. RELATIVE STRENGTH vs KLCI
+// ============================================================
+bench_close = request.security(benchmark_sym, "D", close)
+stock_chg = (close / close[rs_lookback] - 1) * 100
+bench_chg = (bench_close / bench_close[rs_lookback] - 1) * 100
+rs_outperf = stock_chg - bench_chg
+
+// ============================================================
+// 4. MACRO FILTER (KLCI > EMA50)
+// ============================================================
+klci_ema50 = request.security(benchmark_sym, "D", ta.ema(close, 50))
+klci_bull = bench_close > klci_ema50
+
+// ============================================================
+// 4b. COMMODITY / INTERMARKET FILTER
+// ============================================================
+// Default symbols chosen for maximum availability across TradingView plans
+comm_sym = industry == "Oil & Gas" ? "NYMEX:CL1!" : industry == "Plantation (CPO)" ? "BMD:FCPO1!" : industry == "Semiconductor" ? "CME_MINI:SOX1!" : industry == "Metals (Copper)" ? "COMEX:HG1!" : industry == "Gold / Precious" ? "COMEX:GC1!" : industry == "Steel / Iron Ore" ? "COMEX:TIO1!" : industry == "USD/MYR exporter" ? "FX_IDC:USDMYR" : industry == "Banking (10Y yield)" ? "TVC:MY10Y" : industry == "REIT (10Y yield inverse)" ? "TVC:MY10Y" : industry == "Custom" ? custom_comm_sym : ""
+
+// Determine if relationship is inverse (driver falling = bullish for stock)
+comm_is_inverse = industry == "REIT (10Y yield inverse)" or (industry == "Custom" and custom_inverse)
+
+comm_close_v = industry == "None" ? float(na) : request.security(comm_sym, "D", close, ignore_invalid_symbol=true)
+comm_ema50_v = industry == "None" ? float(na) : request.security(comm_sym, "D", ta.ema(close, 50), ignore_invalid_symbol=true)
+comm_above_ema50 = not na(comm_close_v) and not na(comm_ema50_v) and comm_close_v > comm_ema50_v
+// "supportive" = inverse-aware bullish state
+comm_supportive = comm_is_inverse ? (not na(comm_close_v) and not na(comm_ema50_v) and comm_close_v < comm_ema50_v) : comm_above_ema50
+comm_check_passes = industry == "None" or comm_supportive
+
+comm_status = industry == "None" ? "—" : na(comm_close_v) ? "n/a (bad symbol)" : comm_supportive ? "✓ SUPPORTIVE" : "✗ UNSUPPORTIVE"
+
+// Short display name for the actual symbol being checked
+comm_display_sym = industry == "None" ? "—" : comm_sym
+
+// ============================================================
+// 5. GATES (Minervini Trend Template adapted for KLSE swing)
+// ============================================================
+g1_ema200    = not require_above_ema200 or close > ema200
+g2_50over200 = not require_50_above_200 or ema50 > ema200
+g3_priceEma50= not require_price_above_50 or close > ema50
+g4_off52h    = pct_from_52h >= -within_52w_high_pct
+g5_above52l  = pct_from_52l >= above_52w_low_pct
+g6_rs        = rs_outperf >= min_rs_pct
+g7_vcp       = vol_dryup or pullback_pct >= -max_pullback_pct
+g8_macro     = not require_klci_bull or klci_bull
+
+setup_gates_total = (g1_ema200 ? 1 : 0) + (g2_50over200 ? 1 : 0) + (g3_priceEma50 ? 1 : 0) + (g4_off52h ? 1 : 0) + (g5_above52l ? 1 : 0) + (g6_rs ? 1 : 0) + (g7_vcp ? 1 : 0) + (g8_macro ? 1 : 0)
+
+setup_clean = setup_gates_total >= 7   // need 7 of 8 — VCP gate can be soft
+
+// ============================================================
+// 6. POSITION SIZING (RISK-BASED)
+// ============================================================
+entry_price = close
+stop_price  = entry_price * (1 - stop_pct / 100)
+risk_per_share = entry_price - stop_price
+risk_rm = portfolio_rm * risk_per_trade / 100
+
+risk_units = risk_per_share > 0 ? math.floor(risk_rm / risk_per_share / 100) * 100 : 0
+max_units  = math.floor((portfolio_rm * swing_max_pct / 100) / entry_price / 100) * 100
+final_units = math.min(risk_units, max_units)
+position_value = final_units * entry_price
+position_pct = portfolio_rm > 0 ? position_value / portfolio_rm * 100 : 0
+
+tp1_price = entry_price + risk_per_share * tp1_r
+tp2_price = entry_price + risk_per_share * tp2_r
+
+// ============================================================
+// 7. COST-AWARE NET R:R CHECK
+// ============================================================
+f_trade_cost(float value, bool is_sell) =>
+    comm = math.max(value * comm_pct / 100, comm_min_rm)
+    clr  = value * clearing_pct / 100
+    sc   = value * sc_fee_pct / 100
+    stamp = is_sell ? math.min(value * stamp_pct / 100, 1000.0) : 0.0
+    comm + clr + sc + stamp
+
+buy_cost = f_trade_cost(position_value, false)
+// Average exit assumes 50/50 split between TP1 and TP2
+exit_value_avg = final_units * (tp1_price + tp2_price) / 2
+sell_cost = f_trade_cost(exit_value_avg, true)
+total_cost = buy_cost + sell_cost
+
+// At stop loss
+stop_value = final_units * stop_price
+stop_loss_cost = f_trade_cost(stop_value, true)
+gross_loss = (entry_price - stop_price) * final_units
+net_loss   = gross_loss + buy_cost + stop_loss_cost
+
+// At target (50/50 TP1/TP2)
+gross_win = ((tp1_price - entry_price) + (tp2_price - entry_price)) / 2 * final_units
+net_win   = gross_win - total_cost
+
+net_rr = net_loss > 0 ? net_win / net_loss : 0
+cost_viable = net_rr >= min_net_rr
+
+// Minimum viable position for the cost structure
+// At pure % fees only (ignoring minimums): independent of size
+// Where minimums bite: need position large enough that 2×comm_min is small vs gross win
+gross_win_pct = (tp1_r + tp2_r) / 2 * stop_pct  // average % win at target mix
+min_viable_rm = comm_min_rm > 0 and gross_win_pct > 0 ? (2 * comm_min_rm) / (gross_win_pct / 100 / 4) : 0
+// /4 = leave 75% headroom; rough heuristic
+
+// ============================================================
+// 8. ENTRY TRIGGER
+// ============================================================
+swing_buy = setup_clean and breakout and cost_viable
+swing_buy_fresh = swing_buy and not swing_buy[1]
+
+// ----- VCP COIL DETECTION (Minervini contraction proxy) -----
+// Thresholds depend on mode:
+atr_thr_used = coil_mode == "Match V8 (lenient)" ? 0.85 : coil_mode == "Strict (high quality)" ? 0.70 : atr_ratio_thr
+vol_thr_used = coil_mode == "Match V8 (lenient)" ? 0.90 : coil_mode == "Strict (high quality)" ? 0.80 : vol_ratio_thr
+pull_thr_used = coil_mode == "Match V8 (lenient)" ? -10.0 : coil_mode == "Strict (high quality)" ? -8.0 : coil_pullback_thr
+
+atr_recent = ta.atr(5)
+atr_base   = ta.atr(30)
+atr_contracting = atr_recent < atr_base * atr_thr_used
+
+vol_recent_5  = ta.sma(volume, 5)
+vol_base_30   = ta.sma(volume, 30)
+vol_contracting = vol_recent_5 < vol_base_30 * vol_thr_used
+
+coil_pullback_ok = pullback_pct >= pull_thr_used
+
+vcp_coil_tight = atr_contracting and vol_contracting and coil_pullback_ok
+
+// ----- BREAKOUT WITH VOLUME SURGE (confirms coil release) -----
+vol_surge_today = volume >= volAvg50 * breakout_vol_x
+breakout_with_vol = breakout and vol_surge_today
+
+// ----- COMBINED "EXECUTE NOW" — ALL CONDITIONS ALIGNED -----
+// Sequence: coil was tight on prior bars → breakout fires today with volume
+// Commodity check enforced only if user requires it (default: informational only)
+comm_gate_for_execute = not require_comm_gate or comm_check_passes
+execute_now = setup_clean and cost_viable and vcp_coil_tight[1] and breakout_with_vol and klci_bull and comm_gate_for_execute
+execute_now_fresh = execute_now and not execute_now[1]
+
+// ============================================================
+// 8b. TREND RETRACEMENT SIGNAL (Adam Khoo Profit Snapper)
+//     Complementary entry to the breakout: catches the FIRST healthy
+//     pullback to dynamic support inside an established Stage 2 trend.
+//     Less risk than chasing a +5% extended breakout.
+//     Spec: KB file 59_Adam_Khoo_Piranha_Profits.md, Lessons 6-10.
+// ============================================================
+// Required: Stage 2 stack already confirmed via setup_clean (g1+g2+g3)
+//   1. Price pulled back to within 1.5% of 20 EMA or 50 EMA
+//   2. Pullback held above the EMA (didn't break it) for ≥2 of last 5 bars
+//   3. Volume on pullback < 100% of 50-day avg (contracted)
+//   4. Today's bar is a bullish reversal: close > open AND close in upper 60% of bar range
+//      AND close > prior bar close (simple, robust proxy for engulfing/hammer family)
+//   5. KLCI macro green (klci_bull) — never fade a Stage 4 market
+
+// 1. Proximity to dynamic support
+near_ema20 = math.abs(low - ema20) / ema20 < 0.015 or (low < ema20 and close > ema20)
+near_ema50 = math.abs(low - ema50) / ema50 < 0.015 or (low < ema50 and close > ema50)
+at_dynamic_support = near_ema20 or near_ema50
+
+// 2. Held above EMA recently (no clean break)
+above_ema_recently = (close[1] > ema20[1] or close[1] > ema50[1]) and (close[2] > ema20[2] or close[2] > ema50[2])
+
+// 3. Pullback volume contraction
+tr_vol_dryup = ta.sma(volume, 3) < volAvg50
+
+// 4. Bullish reversal bar
+bar_range = high - low
+upper_close_pos = bar_range > 0 ? (close - low) / bar_range : 0.0
+bullish_reversal_bar = close > open and upper_close_pos >= 0.60 and close > close[1]
+
+// 5. Compose
+trend_retrace_buy = setup_clean and cost_viable and klci_bull and comm_gate_for_execute and at_dynamic_support and above_ema_recently and tr_vol_dryup and bullish_reversal_bar
+trend_retrace_buy_fresh = trend_retrace_buy and not trend_retrace_buy[1]
+
+// Suppress if breakout-buy already fired same bar (don't double-signal)
+trend_retrace_buy_only = trend_retrace_buy_fresh and not swing_buy_fresh and not execute_now_fresh
+
+// Verdict text
+verdict = not setup_clean ? "🔴 SETUP INCOMPLETE — " + str.tostring(setup_gates_total) + "/8" : not cost_viable ? "💸 SKIP — Net R:R " + str.tostring(net_rr, "#.##") + " < " + str.tostring(min_net_rr) : not breakout ? "🟡 SETUP CLEAN — wait for breakout" : swing_buy_fresh ? "🟢 SWING BUY — execute" : swing_buy ? "🟢 IN ENTRY ZONE" : "—"
+
+// ============================================================
+// 9. CHART LEVELS
+// ============================================================
+if show_levels and barstate.islast and setup_clean and cost_viable
+    line.new(bar_index - 30, entry_price, bar_index + 5, entry_price,
+             color=color.new(color.blue, 30), width=1, style=line.style_dashed)
+    line.new(bar_index - 30, stop_price, bar_index + 5, stop_price,
+             color=color.new(color.red, 30), width=1, style=line.style_dashed)
+    line.new(bar_index - 30, tp1_price, bar_index + 5, tp1_price,
+             color=color.new(color.green, 50), width=1, style=line.style_dashed)
+    line.new(bar_index - 30, tp2_price, bar_index + 5, tp2_price,
+             color=color.new(color.green, 20), width=1, style=line.style_dashed)
+    label.new(bar_index + 5, entry_price, "ENTRY " + str.tostring(entry_price, "#.###"),
+              color=color.new(color.blue, 30), textcolor=color.white, style=label.style_label_left, size=size.small)
+    label.new(bar_index + 5, stop_price,  "STOP "  + str.tostring(stop_price, "#.###"),
+              color=color.new(color.red, 30), textcolor=color.white, style=label.style_label_left, size=size.small)
+    label.new(bar_index + 5, tp1_price,   "TP1 "   + str.tostring(tp1_price, "#.###"),
+              color=color.new(color.green, 50), textcolor=color.white, style=label.style_label_left, size=size.small)
+    label.new(bar_index + 5, tp2_price,   "TP2 "   + str.tostring(tp2_price, "#.###"),
+              color=color.new(color.green, 20), textcolor=color.white, style=label.style_label_left, size=size.small)
+
+if swing_buy_fresh
+    label.new(bar_index, low * 0.98, "🟢 buy",
+              color=color.new(color.green, 0), textcolor=color.white,
+              style=label.style_label_up, size=size.small)
+
+// Trend Retracement signal (Khoo Profit Snapper) — yellow/amber to distinguish from breakout green
+if trend_retrace_buy_only
+    label.new(bar_index, low * 0.98, "🟡 TR-buy\n(Khoo retrace)",
+              color=color.new(#ffb300, 0), textcolor=color.black,
+              style=label.style_label_up, size=size.small)
+
+// ----- THE BIG BANNER: EXECUTE NOW (both signals aligned + VCP coil released) -----
+if execute_now_fresh
+    label.new(bar_index, low * 0.95,
+              "🟢🟢🟢 EXECUTE NOW 🟢🟢🟢\n" + syminfo.ticker +
+              " | Entry " + str.tostring(entry_price, "#.###") +
+              " | Stop " + str.tostring(stop_price, "#.###") +
+              " | " + str.tostring(final_units) + " sh",
+              color=color.new(#00cc44, 0), textcolor=color.white,
+              style=label.style_label_up, size=size.huge)
+    // Horizontal line at entry — the actual "GO" line
+    line.new(bar_index - 5, entry_price, bar_index + 30, entry_price,
+             color=color.new(#00cc44, 0), width=4, style=line.style_solid)
+
+// ============================================================
+// 10. DASHBOARD
+// ============================================================
+var table v10 = table.new(position.top_right, 2, 22,
+                          bgcolor=#0a0e27, border_color=color.gray, border_width=1)
+
+f_row(int r, string lbl, string val, color valcol) =>
+    table.cell(v10, 0, r, lbl, text_color=color.white, bgcolor=#0a0e27,
+               text_size=size.small, text_halign=text.align_left)
+    table.cell(v10, 1, r, val, text_color=valcol, bgcolor=#0a0e27,
+               text_size=size.small, text_halign=text.align_right)
+
+if show_table and barstate.islast
+    table.cell(v10, 0, 0, "V10 SWING SNIPER", bgcolor=#16213e, text_color=color.yellow, text_size=size.normal)
+    table.cell(v10, 1, 0, syminfo.ticker,     bgcolor=#16213e, text_color=color.yellow, text_size=size.normal)
+    f_row(1,  "Px > EMA200",      g1_ema200 ? "PASS" : "FAIL", g1_ema200 ? color.lime : color.red)
+    f_row(2,  "EMA50 > EMA200",   g2_50over200 ? "PASS" : "FAIL", g2_50over200 ? color.lime : color.red)
+    f_row(3,  "Px > EMA50",       g3_priceEma50 ? "PASS" : "FAIL", g3_priceEma50 ? color.lime : color.red)
+    f_row(4,  "Off 52w high",     str.tostring(pct_from_52h, "#.#") + "%", g4_off52h ? color.lime : color.red)
+    f_row(5,  "Above 52w low",    str.tostring(pct_from_52l, "#.#") + "%", g5_above52l ? color.lime : color.red)
+    f_row(6,  "RS vs KLCI (63d)", str.tostring(rs_outperf, "+#.#;-#.#") + "%", g6_rs ? color.lime : color.red)
+    f_row(7,  "VCP / Pullback",   vol_dryup ? "VOL DRYUP ✓" : pullback_pct >= -max_pullback_pct ? "Pullback OK" : "BROKEN", g7_vcp ? color.lime : color.red)
+    f_row(8,  "KLCI Bull",        klci_bull ? "PASS" : "FAIL", g8_macro ? color.lime : color.red)
+    f_row(9,  industry == "None" ? "Commodity" : industry, comm_status + (industry == "None" ? "" : "  [" + comm_display_sym + "]"),
+          industry == "None" ? color.gray : na(comm_close_v) ? color.red : comm_check_passes ? color.lime : color.red)
+    f_row(10, "Setup Gates",      str.tostring(setup_gates_total) + "/8", setup_clean ? color.lime : color.orange)
+    f_row(11, "Entry / Stop",     str.tostring(entry_price, "#.###") + " / " + str.tostring(stop_price, "#.###"), color.white)
+    f_row(12, "TP1 / TP2",        str.tostring(tp1_price, "#.###") + " / " + str.tostring(tp2_price, "#.###"), color.white)
+    f_row(13, "Position Size",    str.tostring(final_units) + " sh (" + str.tostring(position_pct, "#.#") + "%)", color.white)
+    f_row(14, "Position Cost",    "RM " + str.tostring(position_value, "#"), color.white)
+    f_row(15, "Risk @ Stop",      "RM " + str.tostring(net_loss, "#.#") + " (" + str.tostring(net_loss/portfolio_rm*100, "#.##") + "%)", color.white)
+    f_row(16, "Net R:R (avg TP)", str.tostring(net_rr, "#.##") + " : 1", cost_viable ? color.lime : color.red)
+    f_row(17, "Total Costs",      "RM " + str.tostring(total_cost + stop_loss_cost*0.3, "#.#"), color.white)
+    f_row(18, "VCP Coil",         vcp_coil_tight ? "TIGHT ✓" : atr_contracting ? "ATR contracting" : "LOOSE",
+          vcp_coil_tight ? color.lime : color.gray)
+    f_row(19, "Khoo Trend Retrace", trend_retrace_buy ? "🟡 RETRACE BUY" : at_dynamic_support ? "at EMA support" : "—",
+          trend_retrace_buy ? #ffb300 : at_dynamic_support ? color.yellow : color.gray)
+    f_row(20, "Verdict",          verdict,
+          swing_buy_fresh ? color.lime :
+          not setup_clean ? color.red :
+          not cost_viable ? color.red :
+          not breakout ? color.yellow : color.lime)
+    // THE BIG ROW — the only one that matters
+    table.cell(v10, 0, 21, "▶ EXECUTE", bgcolor=execute_now ? #00cc44 : #1a1a2e,
+               text_color=color.white, text_size=size.large, text_halign=text.align_left)
+    table.cell(v10, 1, 21, execute_now ? "🟢 GO — BUY NOW" : "⛔ HOLD — wait for align",
+               bgcolor=execute_now ? #00cc44 : #1a1a2e,
+               text_color=color.white, text_size=size.large, text_halign=text.align_right)
+
+// ============================================================
+// 11. ALERTS
+// ============================================================
+alertcondition(execute_now_fresh,
+  title="V10 EXECUTE NOW (highest priority)",
+  message="🟢 V10 EXECUTE NOW — all signals aligned, BUY")
+
+alertcondition(swing_buy_fresh,
+  title="V10 Swing BUY",
+  message="🟢 V10 SWING BUY — setup clean + breakout + cost-viable")
+
+alertcondition(setup_clean and not setup_clean[1] and not breakout,
+  title="V10 Setup Forming",
+  message="🟡 V10 Setup clean — waiting for breakout trigger")
+
+alertcondition(trend_retrace_buy_only,
+  title="V10 Khoo Trend Retracement BUY",
+  message="🟡 V10 TREND RETRACE BUY — Stage 2 + pullback to EMA20/50 + vol dryup + bullish reversal bar (Khoo Profit Snapper setup)")
+
+if trend_retrace_buy_only
+    alert("🟡 V10 KHOO TREND RETRACE | " + syminfo.ticker +
+          " | Pulled to EMA20/50 + bullish reversal bar" +
+          " | Entry " + str.tostring(entry_price, "#.###") +
+          " | Stop " + str.tostring(stop_price, "#.###") +
+          " | Size " + str.tostring(final_units) + " sh" +
+          " | Net R:R " + str.tostring(net_rr, "#.##"),
+          alert.freq_once_per_bar)
+
+if execute_now_fresh
+    alert("🟢🟢🟢 V10 EXECUTE NOW | " + syminfo.ticker +
+          " | All signals aligned (VCP coil released + breakout + macro green)" +
+          " | Entry " + str.tostring(entry_price, "#.###") +
+          " | Stop " + str.tostring(stop_price, "#.###") +
+          " | TP1 " + str.tostring(tp1_price, "#.###") +
+          " | TP2 " + str.tostring(tp2_price, "#.###") +
+          " | " + str.tostring(final_units) + " sh" +
+          " | Net R:R " + str.tostring(net_rr, "#.##"),
+          alert.freq_once_per_bar)
+
+if swing_buy_fresh and not execute_now_fresh
+    alert("🟢 V10 SWING BUY | " + syminfo.ticker +
+          " | Entry " + str.tostring(entry_price, "#.###") +
+          " | Stop " + str.tostring(stop_price, "#.###") +
+          " | Size " + str.tostring(final_units) + " sh" +
+          " | Net R:R " + str.tostring(net_rr, "#.##"),
+          alert.freq_once_per_bar)

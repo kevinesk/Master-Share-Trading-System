@@ -1,0 +1,68 @@
+//@version=5
+indicator("KLSE VCP Stage v2", overlay=true, max_bars_back=600)
+
+// ─── Inputs (keep these identical to klse_screener.py CONFIG) ───
+pivotLB  = input.int(15,   "Pivot lookback (bars)")
+buyZone  = input.float(3.0,"Buy zone % above pivot")
+extPct   = input.float(3.0,"Extended: % above pivot")
+dryPct   = input.int(35,   "Volume dry-up percentile")
+coilPct  = input.int(20,   "Coil BB-width percentile")
+tightPct = input.int(10,   "Tight-coil BB-width percentile")
+immPct   = input.float(3.0,"Imminent: max % below pivot")
+showLbl  = input.bool(true,"Show stage label")
+
+// ─── EMAs + Minervini Trend Template (0-8) ───
+e20  = ta.ema(close, 20)
+e50  = ta.ema(close, 50)
+e150 = ta.ema(close, 150)
+e200 = ta.ema(close, 200)
+hi52 = ta.highest(high, 260)
+lo52 = ta.lowest(low, 260)
+tt = (close>e150?1:0) + (close>e200?1:0) + (e150>e200?1:0) + (e200>e200[20]?1:0) + (e50>e150?1:0) + (close>e50?1:0) + ((close/lo52-1)>=0.30?1:0) + ((close/hi52-1)>=-0.25?1:0)
+
+// ─── Pivot & coil low (prior N bars, excluding the current bar) ───
+pivot   = ta.highest(high, pivotLB)[1]
+coilLow = ta.lowest(low,  pivotLB)[1]
+dist    = (close / pivot - 1) * 100
+
+// ─── Bollinger width + percentile-based coil detection ───
+[bbU, bbB, bbL] = ta.bb(close, 20, 2.0)
+bbw   = (bbU - bbL) / bbB
+coil  = bbw <= ta.percentile_nearest_rank(bbw, 252, coilPct)
+tight = bbw <= ta.percentile_nearest_rank(bbw, 252, tightPct)
+
+// ─── Volume: dry-up (coil confirm) vs surge (breakout confirm) ───
+volDry   = ta.sma(volume, 5) <= ta.percentile_nearest_rank(volume, 60, dryPct)
+volSurge = volume >= 1.5 * ta.sma(volume, 20)
+
+// ─── Stage classification (mirrors the Python screener) ───
+aboveE50   = close > e50
+isBreakout = aboveE50 and close > pivot and dist <= extPct
+isExtended = aboveE50 and close > pivot and dist > extPct
+isCoiling  = aboveE50 and close <= pivot and coil and volDry
+isBasing   = aboveE50 and close <= pivot and not (coil and volDry)
+
+stage = isBreakout ? "BREAKOUT" : isExtended ? "EXTENDED" : isCoiling ? "COILING" : isBasing ? "BASING" : "WEAK"
+
+imminent   = isCoiling and dist >= -immPct and dist <= 0 and volDry
+starter    = isCoiling and tight and (close/coilLow - 1)*100 <= 4
+brokeToday = close > pivot and close[1] <= pivot and volSurge
+
+// ─── Visuals ───
+stageCol = isBreakout ? color.new(color.green, 88) : isExtended ? color.new(color.red, 90) : isCoiling ? color.new(color.purple, 87) : isBasing ? color.new(color.orange, 93) : na
+bgcolor(stageCol)
+
+plot(pivot, "Pivot", color=color.new(color.blue,0), linewidth=2)
+plot(pivot*(1+buyZone/100), "Buy-zone top", color=color.new(color.green,30), linewidth=1)
+plot(e50,  "EMA50",  color=color.new(color.blue,40))
+plot(e200, "EMA200", color=color.new(color.red, 40))
+
+lblCol = isBreakout ? color.green : isCoiling ? color.purple : isExtended ? color.red : color.gray
+if showLbl and barstate.islast
+    txt = stage + "  " + str.tostring(dist, "#.#") + "% vs pivot  TT" + str.tostring(tt) + "/8" + (imminent ? "  IMMINENT" : "") + (starter ? "  STARTER 1/3" : "")
+    label.new(bar_index, high, txt, style=label.style_label_down, color=lblCol, textcolor=color.white, size=size.normal)
+
+// ─── Alerts — set ONCE, let them fire so you never chase ───
+alertcondition(brokeToday, "VCP Breakout", "{{ticker}} BROKE OUT above pivot on volume - in BUY ZONE now")
+alertcondition(imminent and not imminent[1], "Coil Imminent", "{{ticker}} coil is now IMMINENT (pinned below pivot) - breakout near")
+alertcondition(starter and not starter[1], "Starter Zone", "{{ticker}} in tight coil near base low - optional 1/3 starter entry")
