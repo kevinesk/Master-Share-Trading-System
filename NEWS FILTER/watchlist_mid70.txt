@@ -1,0 +1,104 @@
+# FBM MID 70 — Component Companies
+# Last verified: May 2026 (index rebalanced quarterly — check bursamalaysia.com for updates)
+# Format: TICKER.KL  SHORT_NAME  Full Company Name (for AI search matching)
+#
+# BANKING & FINANCE
+1066.KL   CIMBA      CIMB Group
+5258.KL   BIMB       BIMB Holdings Bank Islam
+1724.KL   AFFIN      Affin Bank
+2488.KL   MBSB       MBSB Bank
+6139.KL   ALLIANZ    Allianz Malaysia
+
+# INSURANCE & TAKAFUL
+6351.KL   TAKAFUL    Syarikat Takaful Malaysia
+1163.KL   MNRB       MNRB Holdings
+
+# TELECOM
+6399.KL   DIGI       CelcomDigi
+0082.KL   DNEX       Dagang NeXchange
+
+# TECHNOLOGY & SEMICONDUCTORS
+0138.KL   FRONTKEN   Frontken Corp
+7022.KL   JHM        JHM Consolidation
+0072.KL   VITROX     ViTrox Corporation
+7076.KL   MPI        Malaysian Pacific Industries
+5236.KL   UNISEM     Unisem
+9334.KL   KESM       KESM Industries
+0240.KL   GREATECH   Greatech Technology
+0241.KL   PENTAGON   Pentamaster
+7160.KL   ELSOFT     Elsoft Research
+5286.KL   AEMULUS    Aemulus Holdings
+0209.KL   DATASONIC  Datasonic Group
+
+# HEALTHCARE & GLOVES
+7090.KL   KOSSAN     Kossan Rubber
+5127.KL   TOPGLOV    Top Glove
+3867.KL   SUPERMAX   Supermax Corp
+5291.KL   PHARMANIAGA Pharmaniaga
+
+# CONSUMER & RETAIL
+7052.KL   PADINI     Padini Holdings
+6599.KL   AEON       AEON Co
+5234.KL   PARKSON    Parkson Holdings
+5150.KL   MYNEWS     MR DIY Group
+1635.KL   99SMART    99 Speed Mart
+5250.KL   MR DIY     MR DIY Group
+
+# FOOD & BEVERAGE
+3026.KL   DLADY      Dutch Lady
+2836.KL   CARLSBG    Carlsberg Brewery Malaysia
+3255.KL   HEIM       Heineken Malaysia
+3794.KL   BAT        British American Tobacco
+
+# PLANTATION
+2089.KL   TSH        TSH Resources
+2291.KL   TAANN      Ta Ann Holdings
+1929.KL   HSPLANT    Hap Seng Plantations
+2445.KL   KLK        Kuala Lumpur Kepong
+
+# PROPERTY & CONSTRUCTION
+5211.KL   SUNWAY     Sunway
+1066.KL   SUNCON     Sunway Construction
+1724.KL   GAMUDA     Gamuda
+5099.KL   UEMS       UEM Sunrise
+1589.KL   ECOWORLD   EcoWorld Development
+5171.KL   MAHSING    Mah Sing
+1066.KL   IJMLAND    IJM Land
+
+# INFRASTRUCTURE & TRANSPORT
+3867.KL   AIRPORT    Malaysia Airports MAHB
+5014.KL   MAHB       Malaysia Airports Holdings
+6556.KL   AEONCR     AEON Credit Service
+2062.KL   LITRAK     Lingkaran Trans Kota
+5116.KL   PLUS       PLUS Expressways
+
+# OIL & GAS
+5218.KL   SAPURA     Sapura Energy
+7084.KL   VELESTO    Velesto Energy
+0166.KL   REACH      Reach Energy
+5029.KL   YINSON     Yinson Holdings
+5215.KL   WASEONG    Wah Seong Corp
+
+# MANUFACTURING & INDUSTRIAL
+7668.KL   HEVEA      Hevea Board
+7168.KL   SCGM       SCGM
+5135.KL   SCIENTEX   Scientex
+4197.KL    YTLLAND    YTL Land
+2836.KL   HEXZA      Hexza Corp
+7155.KL   LATITUD    Latitude Tree Holdings
+3867.KL   SKPRES     SKP Resources
+
+# GAMING
+3948.KL   BERJAYA    Berjaya Sports Toto
+
+# MEDIA & COMMUNICATIONS
+3719.KL   ASTRO      Astro Malaysia
+
+# LOGISTICS
+5285.KL   GDEX       GD Express
+
+# REITS
+5106.KL   IGBREIT    IGB REIT
+5235.KL   PAVREIT    Pavilion REIT
+1515.KL   SUNREIT    Sunway REIT
+5111.KL   KLCCP      KLCCP Stapled Group

@@ -1,0 +1,57 @@
+# FBM KLCI 30 — Component Companies
+# Last verified: May 2026 (index rebalanced quarterly — check bursamalaysia.com for updates)
+# Format: TICKER.KL  SHORT_NAME  Full Company Name (for AI search matching)
+#
+# BANKING
+1155.KL   MAYBANK    Maybank
+1295.KL   PBBANK     Public Bank
+1023.KL   CIMB       CIMB
+5296.KL   RHBBANK    RHB Bank
+1082.KL   HLBANK     Hong Leong Bank
+5819.KL   HLFG       Hong Leong Financial
+1015.KL   AMBANK     AmBank AMMB
+
+# TELECOM & TECHNOLOGY
+6012.KL   MAXIS      Maxis
+6888.KL   AXIATA     Axiata
+4863.KL   TM         Telekom Malaysia
+
+# ENERGY & UTILITIES
+5347.KL   TENAGA     Tenaga Nasional TNB
+5183.KL   PCHEM      Petronas Chemicals
+6033.KL   PETGAS     Petronas Gas
+5681.KL   PETDAG     Petronas Dagangan
+7277.KL   DIALOG     Dialog Group
+
+# HEALTHCARE
+5225.KL   IHH        IHH Healthcare
+
+# PLANTATION & AGRI
+2445.KL   KLK        Kuala Lumpur Kepong KLK
+5285.KL   SIMEPLT    Sime Darby Plantation SD Guthrie
+1961.KL   IOICORP    IOI Corp
+4065.KL   PPB        PPB Group
+
+# CONSUMER
+3689.KL   NESTLE     Nestle Malaysia
+7084.KL   QL         QL Resources
+
+# GAMING & LEISURE
+3182.KL   GENTING    Genting
+4715.KL   GENM       Genting Malaysia
+
+# TRANSPORT & LOGISTICS
+3816.KL   MISC       MISC
+5246.KL   WESTPORTS  Westports
+
+# MANUFACTURING & MATERIALS
+8869.KL   PMETAL     Press Metal Aluminium
+
+# INFRASTRUCTURE
+4197.KL   YTL        YTL Corp
+
+# SEMICONDUCTORS
+0166.KL   INARI      Inari Amertron
+
+# GLOVES / MEDICAL
+5168.KL   HARTA      Hartalega
